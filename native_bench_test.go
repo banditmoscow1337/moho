@@ -6,32 +6,20 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"os"
 	"testing"
 
-	"github.com/banditmoscow1337/moho/opuscodec"
 	"github.com/banditmoscow1337/moho/voicebuf"
 )
-
-func benchmarkOpus(b *testing.B) {
-	b.Helper()
-	if _, err := opuscodec.Version(); err != nil {
-		if os.Getenv("SAFEM_REQUIRE_OPUS_TEST") == "1" {
-			b.Fatal(err)
-		}
-		b.Skip(err)
-	}
-}
 
 // BenchmarkAudioFrame measures the production encode/decode/mix function,
 // plus pooled ingress and output-ring drain, without a device or scheduler.
 // One operation handles 20 ms of capture and one frame for each remote peer.
 func BenchmarkAudioFrame(b *testing.B) {
-	benchmarkOpus(b)
 	for _, peers := range []int{1, 4, 8} {
 		for _, mode := range []string{"call", "mute", "loss10pct"} {
 			b.Run(fmt.Sprintf("peers%d/%s", peers, mode), func(b *testing.B) {
-				e := NewEngineWithComponents(benchBackend{}, newDefaultCodecFactory())
+				codecs := newDefaultCodecFactory()
+				e := NewEngineWithComponents(benchBackend{}, codecs)
 				defer e.Cleanup()
 				if err := e.Init(); err != nil {
 					b.Fatal(err)
@@ -44,11 +32,12 @@ func BenchmarkAudioFrame(b *testing.B) {
 					}
 				}
 				e.SetMute(mode == "mute")
+
 				w := newPCMWorker()
 				for i := range FrameSizeSamples {
 					binary.LittleEndian.PutUint32(w.input[i*4:], math.Float32bits(float32(0.05*math.Sin(float64(i)*0.0576))))
 				}
-				remote, err := opuscodec.NewEncoder(SampleRate, Channels)
+				remote, err := codecs.NewEncoder(SampleRate, Channels)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -62,6 +51,7 @@ func BenchmarkAudioFrame(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
+
 				push := func(seq uint16) {
 					for _, id := range ids {
 						p := voicebuf.Get()
@@ -74,6 +64,7 @@ func BenchmarkAudioFrame(b *testing.B) {
 				for seq := uint16(0); seq < JitterBufferTarget; seq++ {
 					push(seq)
 				}
+
 				out := make([]byte, frameBytes)
 				send := func(data []byte) { p := voicebuf.Get(); *p = append((*p)[:0], data...); voicebuf.Put(p) }
 				b.ReportAllocs()
@@ -108,7 +99,6 @@ func (benchDevice) Stop() error                                       { return n
 func (benchDevice) Close() error                                      { return nil }
 
 func BenchmarkAudioCallLifecycle(b *testing.B) {
-	benchmarkOpus(b)
 	for _, peers := range []int{1, 4, 8} {
 		b.Run(fmt.Sprintf("peers%d", peers), func(b *testing.B) {
 			ids := make([]string, peers)
