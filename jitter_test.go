@@ -116,3 +116,87 @@ func TestJitterDoesNotRetainOversizedBacking(t *testing.T) {
 		t.Fatalf("jitter retained large backing: cap=%d", cap(*stored))
 	}
 }
+
+func TestJitterBufferNoPrematureBufferingOnDrainedQueue(t *testing.T) {
+	jb := NewJitterBuffer(3)
+	defer jb.Cleanup()
+
+	// Pre-fill to target depth to exit initial buffering
+	pushTestPacket(jb, 0)
+	pushTestPacket(jb, 1)
+	pushTestPacket(jb, 2)
+
+	// Pop all 3 packets
+	popTestPacket(t, jb, 0)
+	popTestPacket(t, jb, 1)
+	popTestPacket(t, jb, 2) // Queue count is now 0, but packet 2 is playing for 20ms
+
+	// Packet 3 arrives on time before the next 20ms Pop callback
+	pushTestPacket(jb, 3)
+
+	// Pop should succeed immediately without locking into buffering mode
+	p := jb.Pop()
+	if p == nil {
+		t.Fatal("Pop returned nil: buffer prematurely re-entered buffering on last packet")
+	}
+	if got := binary.BigEndian.Uint16((*p)[:2]); got != 3 {
+		t.Fatalf("popped seq %d, want 3", got)
+	}
+	releasePacket(p)
+}
+
+func TestJitterBufferLatePacketAfterQueueDrainedDoesNotReanchor(t *testing.T) {
+	jb := NewJitterBuffer(3)
+	defer jb.Cleanup()
+
+	// Fill and drain to count == 0
+	pushTestPacket(jb, 10)
+	pushTestPacket(jb, 11)
+	pushTestPacket(jb, 12)
+
+	popTestPacket(t, jb, 10)
+	popTestPacket(t, jb, 11)
+	popTestPacket(t, jb, 12)
+
+	// Delayed packet 11 arrives after packet 12 was already popped
+	pushTestPacket(jb, 11)
+
+	if stats := jb.Stats(); stats.LatePackets != 1 {
+		t.Fatalf("expected late packet counter = 1, got %d", stats.LatePackets)
+	}
+
+	// Next sequential packet 13 arrives
+	pushTestPacket(jb, 13)
+
+	// Playhead must remain at 12; packet 13 should be ready next
+	popTestPacket(t, jb, 13)
+}
+
+func TestJitterBufferActualUnderrunRebuffers(t *testing.T) {
+	jb := NewJitterBuffer(3)
+	defer jb.Cleanup()
+
+	pushTestPacket(jb, 0)
+	pushTestPacket(jb, 1)
+	pushTestPacket(jb, 2)
+
+	popTestPacket(t, jb, 0)
+	popTestPacket(t, jb, 1)
+	popTestPacket(t, jb, 2)
+
+	// True underrun: consumer asks for audio when count == 0
+	if p := jb.Pop(); p != nil {
+		t.Fatalf("expected nil on underrun, got packet")
+	}
+
+	// Buffer must now be in buffering state
+	pushTestPacket(jb, 3)
+	if p := jb.Pop(); p != nil {
+		t.Fatalf("expected nil while rebuffering below targetDepth, got packet")
+	}
+
+	pushTestPacket(jb, 4)
+	pushTestPacket(jb, 5) // Reached target depth (count == 3)
+
+	popTestPacket(t, jb, 3)
+}

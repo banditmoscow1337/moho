@@ -38,6 +38,10 @@ func (l library) bind(dst any, name string) error {
 	if err != nil {
 		return fmt.Errorf("resolve %s: %w", name, err)
 	}
+	if ptr, ok := dst.(*uintptr); ok {
+		*ptr = proc.Addr()
+		return nil
+	}
 	purego.RegisterFunc(dst, proc.Addr())
 	return nil
 }

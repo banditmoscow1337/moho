@@ -25,14 +25,17 @@ func openLibrary() (library, error) {
 		}
 		return library{h}, nil
 	}
+
 	paths := []string{"libopus.so.0"}
 	if runtime.GOOS == "darwin" {
 		paths = []string{
 			"/opt/homebrew/opt/opus/lib/libopus.0.dylib",
 			"/usr/local/opt/opus/lib/libopus.0.dylib",
-			"libopus.0.dylib", "libopus.dylib",
+			"libopus.0.dylib",
+			"libopus.dylib",
 		}
 	}
+
 	var errs []error
 	for _, path := range paths {
 		h, err := purego.Dlopen(path, purego.RTLD_NOW|purego.RTLD_LOCAL)
@@ -48,6 +51,10 @@ func (l library) bind(dst any, name string) error {
 	addr, err := purego.Dlsym(l.handle, name)
 	if err != nil {
 		return fmt.Errorf("resolve %s: %w", name, err)
+	}
+	if ptr, ok := dst.(*uintptr); ok {
+		*ptr = addr
+		return nil
 	}
 	purego.RegisterFunc(dst, addr)
 	return nil

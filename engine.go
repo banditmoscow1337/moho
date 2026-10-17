@@ -239,31 +239,27 @@ func (jb *JitterBuffer) Pop() *[]byte {
 	// Retrieve Next Packet
 	next := jb.lastPopped + 1
 	slot := &jb.slots[next%JitterBufferWindow]
+
 	var ptr *[]byte
 	if slot.seq == next {
 		ptr = slot.data
 		if ptr != nil {
 			*slot = jitterSlot{}
 			jb.count--
+			jb.lastPopped = next
 		}
 	}
-	jb.lastPopped = next
 
 	if ptr != nil {
-		if jb.count == 0 {
-			jb.buffering = true
-			jb.initialized = false
-		}
 		return ptr
 	}
 
 	// Underrun / Packet Loss
-	// If buffer is completely empty, re-enter buffering state.
+	// If the buffer is completely empty on an underrun, re-enter buffering state.
+	// Retain initialized = true so brief underruns maintain stream playhead continuity.
 	if jb.count == 0 {
 		jb.buffering = true
-		jb.initialized = false
 	}
-
 	// Return nil triggers Packet Loss Concealment (PLC) in the Opus decoder.
 	return nil
 }

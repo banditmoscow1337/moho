@@ -10,35 +10,112 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"sync/atomic"
+	"unsafe"
+
+	"github.com/ebitengine/purego"
 )
 
-const applicationVoIP int32 = 2048
+const (
+	applicationVoIP int32 = 2048
+	opusAllocFail   int32 = -7
+)
 
-var ErrClosed = errors.New("opus codec is closed")
+var (
+	ErrClosed              = errors.New("opus codec is closed")
+	errInvalidEncodeBuffer = errors.New("opus_encode_float: invalid PCM frame or packet buffer")
+	errInvalidDecodeBuffer = errors.New("opus_decode_float: invalid PCM frame or packet buffer")
+)
 
 type functions struct {
-	encoderCreate  func(int32, int32, int32, *int32) uintptr
-	encoderDestroy func(uintptr)
-	encodeFloat    func(uintptr, *float32, int32, *byte, int32) int32
-	decoderCreate  func(int32, int32, *int32) uintptr
-	decoderDestroy func(uintptr)
-	decodeFloat    func(uintptr, *byte, int32, *float32, int32, int32) int32
+	encoderCreate  uintptr
+	encoderDestroy uintptr
+	encodeFloat    uintptr
+	decoderCreate  uintptr
+	decoderDestroy uintptr
+	decodeFloat    uintptr
 	strerror       func(int32) string
 	version        func() string
 }
 
 var shared struct {
 	sync.Mutex
-	f *functions
+	f atomic.Pointer[functions]
+}
+
+// noescape hides a pointer from escape analysis so the fixed argument array
+// passed to purego.SyscallN remains on the stack.
+//
+//go:nosplit
+func noescape(p unsafe.Pointer) unsafe.Pointer {
+	x := uintptr(p)
+	return unsafe.Pointer(x ^ 0)
+}
+
+func syscall1(fn, a1 uintptr) uintptr {
+	var args [1]uintptr
+	args[0] = a1
+	s := unsafe.Slice((*uintptr)(noescape(unsafe.Pointer(&args[0]))), 1)
+	r1, _, _ := purego.SyscallN(fn, s...)
+	return r1
+}
+
+func syscall3(fn, a1, a2, a3 uintptr) uintptr {
+	var args [3]uintptr
+	args[0] = a1
+	args[1] = a2
+	args[2] = a3
+	s := unsafe.Slice((*uintptr)(noescape(unsafe.Pointer(&args[0]))), 3)
+	r1, _, _ := purego.SyscallN(fn, s...)
+	return r1
+}
+
+func syscall4(fn, a1, a2, a3, a4 uintptr) uintptr {
+	var args [4]uintptr
+	args[0] = a1
+	args[1] = a2
+	args[2] = a3
+	args[3] = a4
+	s := unsafe.Slice((*uintptr)(noescape(unsafe.Pointer(&args[0]))), 4)
+	r1, _, _ := purego.SyscallN(fn, s...)
+	return r1
+}
+
+func syscall5(fn, a1, a2, a3, a4, a5 uintptr) uintptr {
+	var args [5]uintptr
+	args[0] = a1
+	args[1] = a2
+	args[2] = a3
+	args[3] = a4
+	args[4] = a5
+	s := unsafe.Slice((*uintptr)(noescape(unsafe.Pointer(&args[0]))), 5)
+	r1, _, _ := purego.SyscallN(fn, s...)
+	return r1
+}
+
+func syscall6(fn, a1, a2, a3, a4, a5, a6 uintptr) uintptr {
+	var args [6]uintptr
+	args[0] = a1
+	args[1] = a2
+	args[2] = a3
+	args[3] = a4
+	args[4] = a5
+	args[5] = a6
+	s := unsafe.Slice((*uintptr)(noescape(unsafe.Pointer(&args[0]))), 6)
+	r1, _, _ := purego.SyscallN(fn, s...)
+	return r1
 }
 
 // getFunctions retries after a missing library is installed. A successfully
 // loaded library stays resident so registered function pointers remain valid.
 func getFunctions() (*functions, error) {
+	if f := shared.f.Load(); f != nil {
+		return f, nil
+	}
 	shared.Lock()
 	defer shared.Unlock()
-	if shared.f != nil {
-		return shared.f, nil
+	if f := shared.f.Load(); f != nil {
+		return f, nil
 	}
 	lib, err := openLibrary()
 	if err != nil {
@@ -63,7 +140,7 @@ func getFunctions() (*functions, error) {
 			return nil, fmt.Errorf("libopus: %w", err)
 		}
 	}
-	shared.f = &f
+	shared.f.Store(&f)
 	return &f, nil
 }
 
@@ -90,105 +167,139 @@ func opusError(f *functions, operation string, code int32) error {
 }
 
 type Encoder struct {
-	f        *functions
 	state    uintptr
 	channels int
 }
 
 func NewEncoder(rate, channels int) (*Encoder, error) {
-	if !validFormat(rate, channels) {
-		return nil, fmt.Errorf("opus encoder: invalid rate %d or channel count %d", rate, channels)
-	}
-	f, err := getFunctions()
+	state, err := newEncoderState(rate, channels)
 	if err != nil {
 		return nil, err
 	}
-	var code int32
-	state := f.encoderCreate(int32(rate), int32(channels), applicationVoIP, &code)
-	if code != 0 || state == 0 {
-		if state != 0 {
-			f.encoderDestroy(state)
-		}
-		return nil, opusError(f, "opus_encoder_create", code)
+	return &Encoder{state, channels}, nil
+}
+
+func newEncoderState(rate, channels int) (uintptr, error) {
+	if !validFormat(rate, channels) {
+		return 0, fmt.Errorf("opus encoder: invalid rate %d or channel count %d", rate, channels)
 	}
-	return &Encoder{f: f, state: state, channels: channels}, nil
+	f, err := getFunctions()
+	if err != nil {
+		return 0, err
+	}
+	state := syscall4(f.encoderCreate, uintptr(rate), uintptr(channels), uintptr(applicationVoIP), 0)
+	if state == 0 {
+		return 0, opusError(f, "opus_encoder_create", opusAllocFail)
+	}
+	return state, nil
 }
 
 func (e *Encoder) EncodeFloat32(pcm []float32, packet []byte) (int, error) {
 	if e == nil || e.state == 0 {
 		return 0, ErrClosed
 	}
-	if len(pcm) == 0 || len(pcm)%e.channels != 0 || len(pcm)/e.channels > math.MaxInt32 ||
-		len(packet) == 0 || len(packet) > math.MaxInt32 {
-		return 0, errors.New("opus_encode_float: invalid PCM frame or packet buffer")
+	if len(pcm) == 0 || len(pcm)%e.channels != 0 || len(pcm)/e.channels > math.MaxInt32 || len(packet) == 0 || len(packet) > math.MaxInt32 {
+		return 0, errInvalidEncodeBuffer
 	}
-	n := e.f.encodeFloat(e.state, &pcm[0], int32(len(pcm)/e.channels), &packet[0], int32(len(packet)))
+	f := shared.f.Load()
+	r1 := syscall5(
+		f.encodeFloat,
+		e.state,
+		uintptr(unsafe.Pointer(&pcm[0])),
+		uintptr(len(pcm)/e.channels),
+		uintptr(unsafe.Pointer(&packet[0])),
+		uintptr(len(packet)),
+	)
 	runtime.KeepAlive(pcm)
 	runtime.KeepAlive(packet)
+	n := int32(r1)
 	if n < 0 {
-		return 0, opusError(e.f, "opus_encode_float", n)
+		return 0, opusError(f, "opus_encode_float", n)
 	}
 	return int(n), nil
 }
 
 func (e *Encoder) Close() error {
 	if e != nil && e.state != 0 {
-		e.f.encoderDestroy(e.state)
-		e.state = 0
+		e.close()
 	}
 	return nil
 }
 
+func (e *Encoder) close() {
+	s := e.state
+	e.state = 0
+	syscall1(shared.f.Load().encoderDestroy, s)
+}
+
 type Decoder struct {
-	f        *functions
 	state    uintptr
 	channels int
 }
 
 func NewDecoder(rate, channels int) (*Decoder, error) {
-	if !validFormat(rate, channels) {
-		return nil, fmt.Errorf("opus decoder: invalid rate %d or channel count %d", rate, channels)
-	}
-	f, err := getFunctions()
+	state, err := newDecoderState(rate, channels)
 	if err != nil {
 		return nil, err
 	}
-	var code int32
-	state := f.decoderCreate(int32(rate), int32(channels), &code)
-	if code != 0 || state == 0 {
-		if state != 0 {
-			f.decoderDestroy(state)
-		}
-		return nil, opusError(f, "opus_decoder_create", code)
+	return &Decoder{state, channels}, nil
+}
+
+func newDecoderState(rate, channels int) (uintptr, error) {
+	if !validFormat(rate, channels) {
+		return 0, fmt.Errorf("opus decoder: invalid rate %d or channel count %d", rate, channels)
 	}
-	return &Decoder{f: f, state: state, channels: channels}, nil
+	f, err := getFunctions()
+	if err != nil {
+		return 0, err
+	}
+	state := syscall3(f.decoderCreate, uintptr(rate), uintptr(channels), 0)
+	if state == 0 {
+		return 0, opusError(f, "opus_decoder_create", opusAllocFail)
+	}
+	return state, nil
 }
 
 func (d *Decoder) DecodeFloat32(packet []byte, pcm []float32) (int, error) {
 	if d == nil || d.state == 0 {
 		return 0, ErrClosed
 	}
-	if len(pcm) == 0 || len(pcm)%d.channels != 0 || len(pcm)/d.channels > math.MaxInt32 ||
-		len(packet) > math.MaxInt32 {
-		return 0, errors.New("opus_decode_float: invalid PCM frame or packet buffer")
+	if len(pcm) == 0 || len(pcm)%d.channels != 0 || len(pcm)/d.channels > math.MaxInt32 || len(packet) > math.MaxInt32 {
+		return 0, errInvalidDecodeBuffer
 	}
-	var data *byte // A nil packet requests packet loss concealment.
+	var data uintptr
+	// A nil packet requests packet loss concealment.
 	if len(packet) != 0 {
-		data = &packet[0]
+		data = uintptr(unsafe.Pointer(&packet[0]))
 	}
-	n := d.f.decodeFloat(d.state, data, int32(len(packet)), &pcm[0], int32(len(pcm)/d.channels), 0)
+	f := shared.f.Load()
+	r1 := syscall6(
+		f.decodeFloat,
+		d.state,
+		data,
+		uintptr(len(packet)),
+		uintptr(unsafe.Pointer(&pcm[0])),
+		uintptr(len(pcm)/d.channels),
+		0,
+	)
 	runtime.KeepAlive(packet)
 	runtime.KeepAlive(pcm)
+	n := int32(r1)
 	if n < 0 {
-		return 0, opusError(d.f, "opus_decode_float", n)
+		return 0, opusError(f, "opus_decode_float", n)
 	}
 	return int(n), nil
 }
 
 func (d *Decoder) Close() error {
 	if d != nil && d.state != 0 {
-		d.f.decoderDestroy(d.state)
-		d.state = 0
+		d.close()
 	}
 	return nil
+}
+
+func (d *Decoder) close() {
+	s := d.state
+	d.state = 0
+	syscall1(shared.f.Load().decoderDestroy, s)
 }
