@@ -1,0 +1,83 @@
+//go:build !safem_test_noaudio
+
+package audio
+
+import (
+	"errors"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestCaptureQueueBoundsDrift(t *testing.T) {
+	q := captureQueue{data: make([]byte, 16)}
+	for n := byte(1); n <= 6; n++ {
+		q.push([]byte{n, n, n, n})
+	}
+	buf := make([]byte, 4)
+	q.pop(buf)
+	if buf[0] != 5 {
+		t.Fatalf("oldest retained byte = %d, want 5", buf[0])
+	}
+	q.pop(buf)
+	if buf[0] != 6 {
+		t.Fatalf("next retained byte = %d, want 6", buf[0])
+	}
+}
+
+type mockNativeBackend struct{ opens atomic.Int32 }
+
+func (b *mockNativeBackend) Init() error                                      { return nil }
+func (b *mockNativeBackend) ListDevices() ([]DeviceInfo, []DeviceInfo, error) { return nil, nil, nil }
+func (b *mockNativeBackend) Open(c DeviceConfig, cb DataCallback) (Device, error) {
+	return openNativeDevice(b, c, cb)
+}
+func (b *mockNativeBackend) Close() error { return nil }
+func (b *mockNativeBackend) openStreams(DeviceConfig) (pcmStream, pcmStream, error) {
+	first := b.opens.Add(1) == 1
+	return &mockNativeStream{}, &mockNativeStream{playback: true, fail: first}, nil
+}
+
+type mockNativeStream struct{ playback, fail bool }
+
+func (s *mockNativeStream) transfer(buf []byte) (int, error) {
+	if s.fail {
+		s.fail = false
+		return 0, errors.New("device disconnected")
+	}
+	if !s.playback {
+		clear(buf)
+	}
+	return len(buf), nil
+}
+func (*mockNativeStream) close() error { return nil }
+
+func TestNativeDeviceReconnectAndQuiesce(t *testing.T) {
+	b := &mockNativeBackend{}
+	var calls atomic.Int32
+	d, err := b.Open(DeviceConfig{SampleRate: 48000, Channels: 1, PeriodMillis: 20}, func(_, _ []byte, _ uint32) { calls.Add(1) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for b.opens.Load() < 2 || calls.Load() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("reopen=%d callback=%d", b.opens.Load(), calls.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := d.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	stopped := calls.Load()
+	time.Sleep(30 * time.Millisecond)
+	if calls.Load() != stopped {
+		t.Fatal("callback continued after Stop")
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
