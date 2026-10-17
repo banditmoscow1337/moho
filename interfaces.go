@@ -17,6 +17,8 @@ type DeviceConfig struct {
 	SampleRate   uint32
 	Channels     uint32
 	PeriodMillis uint32
+	// PlaybackOnly opens an output without requiring a capture device.
+	PlaybackOnly bool
 }
 
 // DataCallback's buffers are borrowed until the callback returns. frameCount

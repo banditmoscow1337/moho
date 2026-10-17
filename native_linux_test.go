@@ -45,3 +45,37 @@ func TestALSANullDuplexWithoutCGO(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestALSANullPlaybackWithoutCapture(t *testing.T) {
+	b := &linuxBackend{}
+	if err := b.Init(); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	var calls atomic.Int32
+	d, err := b.Open(DeviceConfig{
+		InputID: "alsa:does-not-exist", OutputID: "alsa:null",
+		SampleRate: 48000, Channels: 2, PeriodMillis: 20, PlaybackOnly: true,
+	}, func(out, in []byte, frames uint32) {
+		if in != nil || len(out) != int(frames)*8 {
+			t.Errorf("playback-only PCM buffers: %d, %d", len(in), len(out))
+		}
+		calls.Add(1)
+	})
+	if err == nil {
+		err = d.Start()
+	}
+	if err != nil {
+		if os.Getenv("SAFEM_REQUIRE_NATIVE_AUDIO_TEST") == "1" {
+			t.Fatal(err)
+		}
+		t.Skipf("ALSA null PCM unavailable: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() == 0 {
+		t.Fatal("playback-only device did not drive callbacks")
+	}
+}

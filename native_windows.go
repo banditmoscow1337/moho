@@ -382,28 +382,33 @@ func (d *wasapiDevice) session(stop <-chan struct{}, signal func(error)) error {
 		return err
 	}
 	defer winRelease(enum)
-	in, err := d.openStream(enum, d.config.InputID, 1)
-	if err != nil {
-		signal(err)
-		return err
+	var in wasapiStream
+	if !d.config.PlaybackOnly {
+		in, err = d.openStream(enum, d.config.InputID, 1)
+		if err != nil {
+			signal(err)
+			return err
+		}
+		defer in.close()
 	}
-	defer in.close()
 	out, err := d.openStream(enum, d.config.OutputID, 0)
 	if err != nil {
 		signal(err)
 		return err
 	}
 	defer out.close()
-	if err = winOK(winCall(in.client, 10), "capture Start"); err != nil {
-		signal(err)
-		return err
+	if !d.config.PlaybackOnly {
+		if err = winOK(winCall(in.client, 10), "capture Start"); err != nil {
+			signal(err)
+			return err
+		}
 	}
 	if err = winOK(winCall(out.client, 10), "render Start"); err != nil {
 		signal(err)
 		return err
 	}
 	var defaultIn, defaultOut string
-	if d.config.InputID == "" {
+	if !d.config.PlaybackOnly && d.config.InputID == "" {
 		defaultIn, err = d.defaultEndpointID(enum, 1)
 		if err != nil {
 			signal(err)
@@ -422,8 +427,12 @@ func (d *wasapiDevice) session(stop <-chan struct{}, signal func(error)) error {
 	if frames < 1 {
 		frames = 1
 	}
-	q := captureQueue{data: make([]byte, frames*int(d.config.Channels)*4*5)}
-	silence := make([]byte, len(q.data))
+	var q *captureQueue
+	var silence []byte
+	if !d.config.PlaybackOnly {
+		q = &captureQueue{data: make([]byte, frames*int(d.config.Channels)*4*5)}
+		silence = make([]byte, len(q.data))
+	}
 	input, output := make([]byte, frames*int(d.config.Channels)*4), make([]byte, frames*int(d.config.Channels)*4)
 	nextCheck := time.Now().Add(time.Second)
 	for {
@@ -432,10 +441,12 @@ func (d *wasapiDevice) session(stop <-chan struct{}, signal func(error)) error {
 			return nil
 		default:
 		}
-		if err = d.capture(in, &q, silence); err != nil {
-			return err
+		if q != nil {
+			if err = d.capture(in, q, silence); err != nil {
+				return err
+			}
 		}
-		if err = d.render(out, &q, input, output, frames); err != nil {
+		if err = d.render(out, q, input, output, frames); err != nil {
 			return err
 		}
 		if time.Now().After(nextCheck) {
@@ -501,9 +512,14 @@ func (d *wasapiDevice) render(s wasapiStream, q *captureQueue, input, output []b
 	}
 	nframes := min(period, available)
 	size := nframes * int(d.config.Channels) * 4
-	q.pop(input[:size])
+	if q != nil {
+		q.pop(input[:size])
+		input = input[:size]
+	} else {
+		input = nil
+	}
 	clear(output[:size])
-	d.callback(output[:size], input[:size], uint32(nframes))
+	d.callback(output[:size], input, uint32(nframes))
 	var data uintptr
 	if err := winOK(winCall(s.service, 3, uintptr(nframes), uintptr(unsafe.Pointer(&data))), "render GetBuffer"); err != nil {
 		return err

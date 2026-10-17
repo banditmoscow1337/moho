@@ -293,18 +293,27 @@ func (p *pulseAPI) open(c DeviceConfig, input, output string) (pcmStream, pcmStr
 	if len(outName) > 0 {
 		outPtr = uintptr(unsafe.Pointer(&outName[0]))
 	}
-	in := p.newSimple(0, "safem\x00", 2, inPtr, "Voice capture\x00", &spec, 0, &buffer, &code)
-	runtime.KeepAlive(inName)
-	if in == 0 {
-		return nil, nil, fmt.Errorf("PulseAudio capture failed (%d)", code)
+	var in uintptr
+	if !c.PlaybackOnly {
+		in = p.newSimple(0, "safem\x00", 2, inPtr, "Voice capture\x00", &spec, 0, &buffer, &code)
+		runtime.KeepAlive(inName)
+		if in == 0 {
+			return nil, nil, fmt.Errorf("PulseAudio capture failed (%d)", code)
+		}
 	}
 	out := p.newSimple(0, "safem\x00", 1, outPtr, "Voice playback\x00", &spec, 0, &buffer, &code)
 	runtime.KeepAlive(outName)
 	if out == 0 {
-		p.freeSimple(in)
+		if in != 0 {
+			p.freeSimple(in)
+		}
 		return nil, nil, fmt.Errorf("PulseAudio playback failed (%d)", code)
 	}
-	return &pulseStream{api: p, handle: in}, &pulseStream{api: p, handle: out, playback: true}, nil
+	var capture pcmStream
+	if in != 0 {
+		capture = &pulseStream{api: p, handle: in}
+	}
+	return capture, &pulseStream{api: p, handle: out, playback: true}, nil
 }
 
 type pulseStream struct {
@@ -446,16 +455,26 @@ func (a *alsaAPI) open(c DeviceConfig, input, output string) (pcmStream, pcmStre
 		}
 		return &alsaStream{api: a, handle: pcm, channels: int(c.Channels), playback: stream == 0}, nil
 	}
-	in, err := open(input, 1)
-	if err != nil {
-		return nil, nil, err
+	var in *alsaStream
+	var err error
+	if !c.PlaybackOnly {
+		in, err = open(input, 1)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	out, err := open(output, 0)
 	if err != nil {
-		_ = in.close()
+		if in != nil {
+			_ = in.close()
+		}
 		return nil, nil, err
 	}
-	return in, out, nil
+	var capture pcmStream
+	if in != nil {
+		capture = in
+	}
+	return capture, out, nil
 }
 
 type alsaStream struct {
