@@ -219,21 +219,29 @@ func (b *coreAudioBackend) Open(c DeviceConfig, cb DataCallback) (Device, error)
 }
 
 func (b *coreAudioBackend) openStreams(c DeviceConfig) (pcmStream, pcmStream, error) {
-	inID, err := b.deviceID(c.InputID, macDefaultInput)
-	if err != nil {
-		return nil, nil, err
+	var in pcmStream
+	if !c.PlaybackOnly {
+		inID, err := b.deviceID(c.InputID, macDefaultInput)
+		if err != nil {
+			return nil, nil, err
+		}
+		in, err = b.openUnit(c, inID, false)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	outID, err := b.deviceID(c.OutputID, macDefaultOutput)
 	if err != nil {
-		return nil, nil, err
-	}
-	in, err := b.openUnit(c, inID, false)
-	if err != nil {
+		if in != nil {
+			_ = in.close()
+		}
 		return nil, nil, err
 	}
 	out, err := b.openUnit(c, outID, true)
 	if err != nil {
-		_ = in.close()
+		if in != nil {
+			_ = in.close()
+		}
 		return nil, nil, err
 	}
 	return in, out, nil

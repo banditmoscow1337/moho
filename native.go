@@ -120,7 +120,9 @@ func (d *nativeDevice) run(stop <-chan struct{}, done chan<- struct{}, capture, 
 	for {
 		d.pump(stop, capture, playback)
 		_ = playback.close()
-		_ = capture.close()
+		if capture != nil {
+			_ = capture.close()
+		}
 		select {
 		case <-stop:
 			return
@@ -151,37 +153,39 @@ func (d *nativeDevice) pump(stop <-chan struct{}, capture, playback pcmStream) {
 	period := time.Duration(d.config.PeriodMillis) * time.Millisecond
 	readDone := make(chan struct{})
 	abort := make(chan struct{})
-	go func() {
-		defer close(readDone)
-		buf := make([]byte, size)
-		next := time.Now()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-abort:
-				return
-			default:
-			}
-			n, err := capture.transfer(buf)
-			if err != nil {
-				return
-			}
-			if n > 0 {
-				q.push(buf[:n])
-				// A null/virtual endpoint may not pace reads at all.
-				next = next.Add(time.Duration(n) * period / time.Duration(size))
-				if delay := time.Until(next); delay > 0 {
-					time.Sleep(delay)
-				} else {
-					next = time.Now()
+	if capture != nil {
+		go func() {
+			defer close(readDone)
+			buf := make([]byte, size)
+			next := time.Now()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-abort:
+					return
+				default:
 				}
-				continue
+				n, err := capture.transfer(buf)
+				if err != nil {
+					return
+				}
+				if n > 0 {
+					q.push(buf[:n])
+					// A null/virtual endpoint may not pace reads at all.
+					next = next.Add(time.Duration(n) * period / time.Duration(size))
+					if delay := time.Until(next); delay > 0 {
+						time.Sleep(delay)
+					} else {
+						next = time.Now()
+					}
+					continue
+				}
+				time.Sleep(2 * time.Millisecond)
 			}
-			time.Sleep(2 * time.Millisecond)
-		}
-	}()
-	defer func() { close(abort); <-readDone }()
+		}()
+		defer func() { close(abort); <-readDone }()
+	}
 	// The playback device paces the loop. If a backend reports zero progress,
 	// yield briefly instead of spinning at 100% CPU.
 	next := time.Now()
@@ -189,11 +193,18 @@ func (d *nativeDevice) pump(stop <-chan struct{}, capture, playback pcmStream) {
 		select {
 		case <-stop:
 			return
-		case <-readDone:
-			return
 		default:
 		}
-		q.pop(input)
+		if capture != nil {
+			select {
+			case <-readDone:
+				return
+			default:
+			}
+			q.pop(input)
+		} else {
+			input = nil
+		}
 		clear(output)
 		d.callback(output, input, uint32(frames))
 		for remaining := output; len(remaining) > 0; {

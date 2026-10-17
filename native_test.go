@@ -33,7 +33,11 @@ func (b *mockNativeBackend) Open(c DeviceConfig, cb DataCallback) (Device, error
 	return openNativeDevice(b, c, cb)
 }
 func (b *mockNativeBackend) Close() error { return nil }
-func (b *mockNativeBackend) openStreams(DeviceConfig) (pcmStream, pcmStream, error) {
+func (b *mockNativeBackend) openStreams(c DeviceConfig) (pcmStream, pcmStream, error) {
+	if c.PlaybackOnly {
+		b.opens.Add(1)
+		return nil, &mockNativeStream{playback: true}, nil
+	}
 	first := b.opens.Add(1) == 1
 	return &mockNativeStream{}, &mockNativeStream{playback: true, fail: first}, nil
 }
@@ -76,6 +80,36 @@ func TestNativeDeviceReconnectAndQuiesce(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 	if calls.Load() != stopped {
 		t.Fatal("callback continued after Stop")
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNativePlaybackOnly(t *testing.T) {
+	b := &mockNativeBackend{}
+	called := make(chan struct{}, 1)
+	d, err := b.Open(DeviceConfig{
+		SampleRate: 48000, Channels: 2, PeriodMillis: 20, PlaybackOnly: true,
+	}, func(out, in []byte, frames uint32) {
+		if in != nil || len(out) != int(frames)*8 {
+			t.Errorf("playback-only buffers: %d input bytes, %d output bytes", len(in), len(out))
+		}
+		select {
+		case called <- struct{}{}:
+		default:
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Start(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("playback-only callback was not called")
 	}
 	if err := d.Close(); err != nil {
 		t.Fatal(err)
