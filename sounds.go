@@ -83,40 +83,59 @@ type soundVoice struct {
 // completed voices and report stream errors. Streaming I/O runs on workers;
 // neither Update nor the device callback reads files.
 type Driver struct {
-	controlMu     sync.Mutex // serializes public operations
-	mu            sync.Mutex // protects the voices from the device callback
-	backend       Backend
-	device        Device
-	voices        []soundVoice
-	cache         map[string]cachedPCM
-	master        float64
-	serial        VoiceID
-	paused        bool
-	closed        bool
-	pendingErr    error
-	workers       sync.WaitGroup
-	streamStarves atomic.Uint64
-	debug         bool
-	nextReport    time.Time           // accessed under controlMu
-	lastReport    PlaybackDiagnostics // accessed under controlMu
+	controlMu             sync.Mutex // serializes public operations
+	mu                    sync.Mutex // protects the voices from the device callback
+	backend               Backend
+	device                Device
+	voices                []soundVoice
+	cache                 map[string]cachedPCM
+	master                float64
+	serial                VoiceID
+	paused                bool
+	closed                bool
+	pendingErr            error
+	workers               sync.WaitGroup
+	streamStarves         atomic.Uint64
+	mixerCallbacks        atomic.Uint64
+	nonzeroMixerCallbacks atomic.Uint64
+	debug                 bool
+	nextReport            time.Time           // accessed under controlMu
+	lastReport            PlaybackDiagnostics // accessed under controlMu
 }
 
 // PlaybackDiagnostics counts callbacks that ran out of streaming PCM and
 // CoreAudio callbacks that had to fill an empty output FIFO with silence.
 // Counters are cumulative for the lifetime of the driver.
 type PlaybackDiagnostics struct {
-	StreamStarves       uint64
-	NativeUnderruns     uint64
-	NativeMissingFrames uint64
+	StreamStarves         uint64
+	MixerCallbacks        uint64
+	NonzeroMixerCallbacks uint64
+	NativeCallbacks       uint64
+	NativeUnderruns       uint64
+	NativeMissingFrames   uint64
+	NativeReconnects      uint64
+	NativeOpenFailures    uint64
+	LastReconnectError    string
 }
 
 func (d *Driver) Diagnostics() PlaybackDiagnostics {
 	if d == nil {
 		return PlaybackDiagnostics{}
 	}
-	stats := PlaybackDiagnostics{StreamStarves: d.streamStarves.Load()}
-	if output, ok := d.backend.(interface{ outputUnderruns() (uint64, uint64) }); ok {
-		stats.NativeUnderruns, stats.NativeMissingFrames = output.outputUnderruns()
+	stats := PlaybackDiagnostics{
+		StreamStarves:         d.streamStarves.Load(),
+		MixerCallbacks:        d.mixerCallbacks.Load(),
+		NonzeroMixerCallbacks: d.nonzeroMixerCallbacks.Load(),
+	}
+	if output, ok := d.backend.(interface {
+		outputStats() (uint64, uint64, uint64)
+	}); ok {
+		stats.NativeCallbacks, stats.NativeUnderruns, stats.NativeMissingFrames = output.outputStats()
+	}
+	if device, ok := d.device.(interface {
+		reconnectStats() (uint64, uint64, string)
+	}); ok {
+		stats.NativeReconnects, stats.NativeOpenFailures, stats.LastReconnectError = device.reconnectStats()
 	}
 	return stats
 }
@@ -424,10 +443,20 @@ func (d *Driver) Update() error {
 	err := d.updateLocked()
 	if d.debug && time.Now().After(d.nextReport) {
 		stats := d.Diagnostics()
-		log.Printf("moho audio stream_starves=%d fifo_underruns=%d fifo_missing_frames=%d",
+		reason := ""
+		if stats.NativeReconnects > d.lastReport.NativeReconnects {
+			reason = stats.LastReconnectError
+		}
+		log.Printf("moho audio mixer_calls=%d mixed_nonzero=%d coreaudio_callbacks=%d stream_starves=%d fifo_underruns=%d fifo_missing_frames=%d reconnects=%d reopen_failures=%d reconnect_reason=%q",
+			stats.MixerCallbacks-d.lastReport.MixerCallbacks,
+			stats.NonzeroMixerCallbacks-d.lastReport.NonzeroMixerCallbacks,
+			stats.NativeCallbacks-d.lastReport.NativeCallbacks,
 			stats.StreamStarves-d.lastReport.StreamStarves,
 			stats.NativeUnderruns-d.lastReport.NativeUnderruns,
-			stats.NativeMissingFrames-d.lastReport.NativeMissingFrames)
+			stats.NativeMissingFrames-d.lastReport.NativeMissingFrames,
+			stats.NativeReconnects-d.lastReport.NativeReconnects,
+			stats.NativeOpenFailures-d.lastReport.NativeOpenFailures,
+			reason)
 		d.lastReport = stats
 		d.nextReport = time.Now().Add(3 * time.Second)
 	}
@@ -589,6 +618,7 @@ func (d *Driver) Close() error {
 // callback mixes directly into the backend's little-endian float32 output.
 // It holds no stream I/O or user callback and allocates no per-frame storage.
 func (d *Driver) callback(output, _ []byte, frameCount uint32) {
+	d.mixerCallbacks.Add(1)
 	clear(output)
 	frames := min(len(output)/8, int(frameCount))
 	d.mu.Lock()
@@ -630,12 +660,19 @@ func (d *Driver) callback(output, _ []byte, frameCount uint32) {
 			}
 		}
 	}
+	nonzero := false
 	for frame := 0; frame < frames; frame++ {
 		for channel := 0; channel < 2; channel++ {
 			i := frame*8 + channel*4
 			sample := math.Float32frombits(binary.LittleEndian.Uint32(output[i:]))
+			if sample != 0 {
+				nonzero = true
+			}
 			binary.LittleEndian.PutUint32(output[i:], math.Float32bits(max(-1, min(1, sample))))
 		}
+	}
+	if nonzero {
+		d.nonzeroMixerCallbacks.Add(1)
 	}
 }
 

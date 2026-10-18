@@ -361,6 +361,9 @@ func TestSoundDriverReportsStreamStarvation(t *testing.T) {
 	if got := d.Diagnostics().StreamStarves; got != 1 {
 		t.Fatalf("stream starvation count = %d, want 1", got)
 	}
+	if stats := d.Diagnostics(); stats.MixerCallbacks != 1 || stats.NonzeroMixerCallbacks != 0 {
+		t.Fatalf("unexpected mixer diagnostics before refill: %+v", stats)
+	}
 	unblock.Do(func() { close(reader.release) })
 	waitForVoice(t, d, id, func(v *soundVoice) bool { return len(v.pcm) >= soundChunk })
 	if sample := renderSound(b, 1)[0]; sample != 0.5 {
@@ -368,6 +371,9 @@ func TestSoundDriverReportsStreamStarvation(t *testing.T) {
 	}
 	if got := d.Diagnostics().StreamStarves; got != 1 {
 		t.Fatalf("stream starvation grew after refill: %d", got)
+	}
+	if stats := d.Diagnostics(); stats.MixerCallbacks != 2 || stats.NonzeroMixerCallbacks != 1 {
+		t.Fatalf("unexpected mixer diagnostics after refill: %+v", stats)
 	}
 }
 
