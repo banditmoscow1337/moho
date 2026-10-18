@@ -25,7 +25,10 @@ func TestCaptureQueueBoundsDrift(t *testing.T) {
 	}
 }
 
-type mockNativeBackend struct{ opens atomic.Int32 }
+type mockNativeBackend struct {
+	opens  atomic.Int32
+	writes chan struct{}
+}
 
 func (b *mockNativeBackend) Init() error                                      { return nil }
 func (b *mockNativeBackend) ListDevices() ([]DeviceInfo, []DeviceInfo, error) { return nil, nil, nil }
@@ -36,13 +39,16 @@ func (b *mockNativeBackend) Close() error { return nil }
 func (b *mockNativeBackend) openStreams(c DeviceConfig) (pcmStream, pcmStream, error) {
 	if c.PlaybackOnly {
 		b.opens.Add(1)
-		return nil, &mockNativeStream{playback: true}, nil
+		return nil, &mockNativeStream{playback: true, writes: b.writes}, nil
 	}
 	first := b.opens.Add(1) == 1
 	return &mockNativeStream{}, &mockNativeStream{playback: true, fail: first}, nil
 }
 
-type mockNativeStream struct{ playback, fail bool }
+type mockNativeStream struct {
+	playback, fail bool
+	writes         chan struct{}
+}
 
 func (s *mockNativeStream) transfer(buf []byte) (int, error) {
 	if s.fail {
@@ -51,6 +57,11 @@ func (s *mockNativeStream) transfer(buf []byte) (int, error) {
 	}
 	if !s.playback {
 		clear(buf)
+	} else if s.writes != nil {
+		select {
+		case s.writes <- struct{}{}:
+		default:
+		}
 	}
 	return len(buf), nil
 }
@@ -113,5 +124,29 @@ func TestNativePlaybackOnly(t *testing.T) {
 	}
 	if err := d.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNativePlaybackPrimesBuffer(t *testing.T) {
+	// A virtual stream accepts every write immediately. The first three
+	// periods must be submitted before a full period of wall time elapses;
+	// otherwise CoreAudio's FIFO starts with only one period of headroom.
+	b := &mockNativeBackend{writes: make(chan struct{}, 4)}
+	d, err := b.Open(DeviceConfig{
+		SampleRate: 48000, Channels: 2, PeriodMillis: 500, PlaybackOnly: true,
+	}, func(_, _ []byte, _ uint32) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	for i := 0; i < 3; i++ {
+		select {
+		case <-b.writes:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatalf("only %d periods submitted before playback pacing", i)
+		}
 	}
 }
