@@ -6,7 +6,10 @@ import (
 	"errors"
 	"io"
 	"math"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func testSound(name string, pcm []byte) *Sound {
@@ -24,6 +27,40 @@ func renderSound(b *testBackend, frames uint32) []float32 {
 		samples[i] = math.Float32frombits(binary.LittleEndian.Uint32(output[i*4:]))
 	}
 	return samples
+}
+
+func waitForVoice(t *testing.T, d *Driver, id VoiceID, ready func(*soundVoice) bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		d.mu.Lock()
+		ok := false
+		for i := range d.voices {
+			if d.voices[i].id == id && ready(&d.voices[i]) {
+				ok = true
+				break
+			}
+		}
+		d.mu.Unlock()
+		if ok {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("stream did not become ready")
+}
+
+func waitForDriverError(t *testing.T, d *Driver) error {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := d.Update(); err != nil {
+			return err
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("stream error was not reported")
+	return nil
 }
 
 func TestSoundDriverPriorityAndMusicProtection(t *testing.T) {
@@ -150,7 +187,7 @@ func TestSoundDriverConversionAndStreaming(t *testing.T) {
 	if err := d.Update(); err != nil {
 		t.Fatal(err)
 	}
-	closed := 0
+	var closed atomic.Int32
 	stream := &Sound{
 		Name: "stream", Format: PCMFormat{Channels: 1, BitsPerSample: 16, SampleRate: 48000},
 		Streaming: true, BaseVolume: 1,
@@ -162,12 +199,14 @@ func TestSoundDriverConversionAndStreaming(t *testing.T) {
 	if err != nil || id == 0 {
 		t.Fatalf("stream: %v, %v", id, err)
 	}
+	waitForVoice(t, d, id, func(v *soundVoice) bool { return !v.streaming && len(v.pcm) > 0 })
+	d.workers.Wait()
 	if samples := renderSound(b, 5); samples[0] != 0.5 || samples[2] != 0.25 ||
 		samples[4] != 0.5 || samples[8] != 0.5 {
 		t.Fatalf("looping stream: %v", samples)
 	}
-	if closed != 1 {
-		t.Fatalf("short looping stream was not cached and closed: %d", closed)
+	if closed.Load() != 1 {
+		t.Fatalf("short looping stream was not cached and closed: %d", closed.Load())
 	}
 	d.StopVoice(id)
 	if err := d.Update(); err != nil {
@@ -177,10 +216,10 @@ func TestSoundDriverConversionAndStreaming(t *testing.T) {
 
 type countingReader struct {
 	io.Reader
-	closed *int
+	closed *atomic.Int32
 }
 
-func (r *countingReader) Close() error { *r.closed++; return nil }
+func (r *countingReader) Close() error { r.closed.Add(1); return nil }
 
 func TestSoundDriverErrors(t *testing.T) {
 	if _, err := NewDriverWithBackend(0, &testBackend{}); err == nil {
@@ -201,12 +240,18 @@ func TestSoundDriverErrors(t *testing.T) {
 		t.Fatal("stream without opener accepted")
 	}
 	bad.PCMOpener = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(nil)), nil }
-	if _, err := d.Play(bad, 1, false); err == nil {
-		t.Fatal("empty stream accepted")
+	if _, err := d.Play(bad, 1, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForDriverError(t, d); err == nil {
+		t.Fatal("empty stream was not reported")
 	}
 	readErr := errors.New("bad stream")
 	bad.PCMOpener = func() (io.ReadCloser, error) { return nil, readErr }
-	if _, err := d.Play(bad, 1, false); !errors.Is(err, readErr) {
+	if _, err := d.Play(bad, 1, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForDriverError(t, d); !errors.Is(err, readErr) {
 		t.Fatalf("missing opener error: %v", err)
 	}
 	if _, err := d.Play(testSound("x", []byte{0, 0}), math.NaN(), false); err == nil {
@@ -221,7 +266,7 @@ func TestSoundDriverStreamCompletionReleasesVoice(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	closed := 0
+	var closed atomic.Int32
 	s := &Sound{
 		Name: "one-shot", Format: PCMFormat{Channels: 1, BitsPerSample: 16, SampleRate: 48000},
 		Streaming: true, BaseVolume: 1,
@@ -233,17 +278,89 @@ func TestSoundDriverStreamCompletionReleasesVoice(t *testing.T) {
 	if err != nil || first == 0 {
 		t.Fatalf("play stream: %v, %v", first, err)
 	}
+	waitForVoice(t, d, first, func(v *soundVoice) bool { return v.streamEOF && len(v.pcm) > 0 })
+	d.workers.Wait()
 	if sample := renderSound(b, 1)[0]; sample != 0.5 {
 		t.Fatalf("stream sample: %v", sample)
 	}
 	if err := d.Update(); err != nil {
 		t.Fatal(err)
 	}
-	if closed != 1 {
-		t.Fatalf("completed stream still open: %d", closed)
+	if closed.Load() != 1 {
+		t.Fatalf("completed stream still open: %d", closed.Load())
 	}
 	next, err := d.Play(testSound("next", []byte{0, 32}), 1, false)
 	if err != nil || next == 0 || next == first {
 		t.Fatalf("voice slot was not reusable: %v, %v", next, err)
+	}
+}
+
+type blockingPCMReader struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingPCMReader) Read([]byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	return 0, io.EOF
+}
+
+func (r *blockingPCMReader) Close() error { return nil }
+
+func TestSlowStreamDoesNotBlockUpdateOrEffects(t *testing.T) {
+	b := &testBackend{}
+	d, err := NewDriverWithBackend(1, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &blockingPCMReader{started: make(chan struct{}), release: make(chan struct{})}
+	defer func() {
+		close(reader.release)
+		if err := d.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	stream := &Sound{
+		Name: "slow", Format: PCMFormat{Channels: 1, BitsPerSample: 16, SampleRate: 48000},
+		Streaming: true, BaseVolume: 1,
+		PCMOpener: func() (io.ReadCloser, error) { return reader, nil },
+	}
+	played := make(chan error, 1)
+	go func() { _, err := d.Play(stream, 1, false); played <- err }()
+	select {
+	case err := <-played:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Play waited for the stream reader")
+	}
+	select {
+	case <-reader.started:
+	case <-time.After(time.Second):
+		t.Fatal("stream worker did not start")
+	}
+	finished := make(chan error, 1)
+	go func() {
+		if err := d.Update(); err != nil {
+			finished <- err
+			return
+		}
+		d.StopSound("slow")
+		_, err := d.Play(testSound("effect", []byte{0, 64}), 2, false)
+		finished <- err
+	}()
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("game-thread audio control waited for the stream reader")
+	}
+	if sample := renderSound(b, 1)[0]; sample != 0.5 {
+		t.Fatalf("effect was not mixed while the stream was blocked: %v", sample)
 	}
 }
