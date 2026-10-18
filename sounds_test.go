@@ -309,6 +309,68 @@ func (r *blockingPCMReader) Read([]byte) (int, error) {
 
 func (r *blockingPCMReader) Close() error { return nil }
 
+type gatedPCMReader struct {
+	io.Reader
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *gatedPCMReader) Read(buf []byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	return r.Reader.Read(buf)
+}
+
+func (r *gatedPCMReader) Close() error { return nil }
+
+func TestSoundDriverReportsStreamStarvation(t *testing.T) {
+	b := &testBackend{}
+	d, err := NewDriverWithBackend(1, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &gatedPCMReader{
+		Reader:  bytes.NewReader(bytes.Repeat([]byte{0, 64}, soundChunk)),
+		started: make(chan struct{}), release: make(chan struct{}),
+	}
+	var unblock sync.Once
+	defer func() {
+		unblock.Do(func() { close(reader.release) })
+		if err := d.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	s := &Sound{
+		Name: "gated", Format: PCMFormat{Channels: 1, BitsPerSample: 16, SampleRate: soundOutputRate},
+		Streaming: true, BaseVolume: 1,
+		PCMOpener: func() (io.ReadCloser, error) { return reader, nil },
+	}
+	id, err := d.Play(s, 1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-reader.started:
+	case <-time.After(time.Second):
+		t.Fatal("stream reader did not start")
+	}
+	if sample := renderSound(b, 1)[0]; sample != 0 {
+		t.Fatalf("stream without PCM played %v, want silence", sample)
+	}
+	if got := d.Diagnostics().StreamStarves; got != 1 {
+		t.Fatalf("stream starvation count = %d, want 1", got)
+	}
+	unblock.Do(func() { close(reader.release) })
+	waitForVoice(t, d, id, func(v *soundVoice) bool { return len(v.pcm) >= soundChunk })
+	if sample := renderSound(b, 1)[0]; sample != 0.5 {
+		t.Fatalf("stream after refill played %v, want 0.5", sample)
+	}
+	if got := d.Diagnostics().StreamStarves; got != 1 {
+		t.Fatalf("stream starvation grew after refill: %d", got)
+	}
+}
+
 func TestSlowStreamDoesNotBlockUpdateOrEffects(t *testing.T) {
 	b := &testBackend{}
 	d, err := NewDriverWithBackend(1, b)
