@@ -4,7 +4,9 @@ package audio
 
 import (
 	"errors"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,13 +26,24 @@ type nativeBackend interface {
 // queue keeps the latest microphone data; the output clock drives the callback.
 // This also keeps native I/O and encoding on different goroutines.
 type nativeDevice struct {
-	backend  nativeBackend
-	config   DeviceConfig
-	callback DataCallback
-	mu       sync.Mutex
-	stop     chan struct{}
-	done     chan struct{}
-	closed   bool
+	backend            nativeBackend
+	config             DeviceConfig
+	callback           DataCallback
+	mu                 sync.Mutex
+	stop               chan struct{}
+	done               chan struct{}
+	closed             bool
+	reconnects         atomic.Uint64
+	openFailures       atomic.Uint64
+	lastReconnectError atomic.Value // string
+}
+
+func (d *nativeDevice) reconnectStats() (uint64, uint64, string) {
+	var reason string
+	if v := d.lastReconnectError.Load(); v != nil {
+		reason = v.(string)
+	}
+	return d.reconnects.Load(), d.openFailures.Load(), reason
 }
 
 func openNativeDevice(b nativeBackend, c DeviceConfig, cb DataCallback) (Device, error) {
@@ -118,7 +131,7 @@ func (q *captureQueue) pop(dst []byte) {
 func (d *nativeDevice) run(stop <-chan struct{}, done chan<- struct{}, capture, playback pcmStream) {
 	defer close(done)
 	for {
-		d.pump(stop, capture, playback)
+		reason := d.pump(stop, capture, playback)
 		_ = playback.close()
 		if capture != nil {
 			_ = capture.close()
@@ -127,6 +140,10 @@ func (d *nativeDevice) run(stop <-chan struct{}, done chan<- struct{}, capture, 
 		case <-stop:
 			return
 		default:
+		}
+		d.reconnects.Add(1)
+		if reason != nil {
+			d.lastReconnectError.Store(reason.Error())
 		}
 		// Transient unplug or server failure: reopen the selected endpoints,
 		// including system defaults which may now point to different devices.
@@ -141,11 +158,12 @@ func (d *nativeDevice) run(stop <-chan struct{}, done chan<- struct{}, capture, 
 			if err == nil {
 				break
 			}
+			d.openFailures.Add(1)
 		}
 	}
 }
 
-func (d *nativeDevice) pump(stop <-chan struct{}, capture, playback pcmStream) {
+func (d *nativeDevice) pump(stop <-chan struct{}, capture, playback pcmStream) error {
 	frames := int(uint64(d.config.SampleRate) * uint64(d.config.PeriodMillis) / 1000)
 	size := frames * int(d.config.Channels) * 4
 	q := &captureQueue{data: make([]byte, size*4)}
@@ -198,13 +216,13 @@ func (d *nativeDevice) pump(stop <-chan struct{}, capture, playback pcmStream) {
 	for {
 		select {
 		case <-stop:
-			return
+			return nil
 		default:
 		}
 		if capture != nil {
 			select {
 			case <-readDone:
-				return
+				return errors.New("capture stopped")
 			default:
 			}
 			q.pop(input)
@@ -216,15 +234,15 @@ func (d *nativeDevice) pump(stop <-chan struct{}, capture, playback pcmStream) {
 		for remaining := output; len(remaining) > 0; {
 			select {
 			case <-stop:
-				return
+				return nil
 			default:
 			}
 			n, err := playback.transfer(remaining)
 			if err != nil {
-				return
+				return fmt.Errorf("playback transfer: %w", err)
 			}
 			if n < 0 || n > len(remaining) {
-				return
+				return errors.New("playback transfer returned invalid byte count")
 			}
 			remaining = remaining[n:]
 			if n == 0 {

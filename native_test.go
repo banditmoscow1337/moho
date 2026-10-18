@@ -87,6 +87,10 @@ func TestNativeDeviceReconnectAndQuiesce(t *testing.T) {
 	if err := d.Stop(); err != nil {
 		t.Fatal(err)
 	}
+	reconnects, openFailures, reason := d.(*nativeDevice).reconnectStats()
+	if reconnects != 1 || openFailures != 0 || reason != "playback transfer: device disconnected" {
+		t.Fatalf("reconnects=%d open failures=%d reason=%q", reconnects, openFailures, reason)
+	}
 	stopped := calls.Load()
 	time.Sleep(30 * time.Millisecond)
 	if calls.Load() != stopped {

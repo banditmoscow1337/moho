@@ -4,7 +4,6 @@ package audio
 
 import (
 	"bytes"
-	"sync"
 	"testing"
 	"time"
 	"unsafe"
@@ -21,71 +20,32 @@ func TestNativeInventory(t *testing.T) {
 	}
 }
 
-func TestCoreAudioDefaultDeviceQueryDoesNotBlockPlayback(t *testing.T) {
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	var once sync.Once
+func TestCoreAudioPlaybackTransferSkipsDeviceProperty(t *testing.T) {
+	queries := 0
 	b := &coreAudioBackend{
-		property: func(_ uint32, _ *macAddress, _ uint32, _ uintptr, _ *uint32, out uintptr) int32 {
-			once.Do(func() { close(entered) })
-			<-release
-			*(*uint32)(unsafe.Pointer(out)) = 42
+		property: func(_ uint32, _ *macAddress, _ uint32, _ uintptr, _ *uint32, _ uintptr) int32 {
+			queries++
 			return 0
 		},
 	}
 	s := &macStream{
-		api: b, playback: true, channels: 2, deviceID: 42, defaultScope: macDefaultOutput,
+		api: b, playback: true, channels: 2,
 		fifo: macFIFO{data: make([]byte, 256)},
 	}
 	s.lastCallback.Store(time.Now().UnixNano())
-	s.startDefaultMonitor()
-	defer func() {
-		close(release)
-		s.stopDefaultMonitor()
-	}()
-	select {
-	case <-entered:
-	case <-time.After(time.Second):
-		t.Fatal("default device check did not start")
-	}
-	finished := make(chan error, 1)
-	go func() {
-		_, err := s.transfer(make([]byte, 8))
-		finished <- err
-	}()
-	select {
-	case err := <-finished:
-		if err != nil {
-			t.Fatal(err)
+	for i := 0; i < 32; i++ {
+		if n, err := s.transfer(make([]byte, 8)); n != 8 || err != nil {
+			t.Fatalf("transfer %d: n=%d err=%v", i, n, err)
 		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("playback transfer waited for the CoreAudio property query")
 	}
-}
-
-func TestCoreAudioDefaultDeviceChangeTriggersReconnect(t *testing.T) {
-	b := &coreAudioBackend{
-		property: func(_ uint32, _ *macAddress, _ uint32, _ uintptr, _ *uint32, out uintptr) int32 {
-			*(*uint32)(unsafe.Pointer(out)) = 99
-			return 0
-		},
+	if queries != 0 {
+		t.Fatalf("playback transfer queried device %d times", queries)
 	}
-	s := &macStream{
-		api: b, playback: true, channels: 2, deviceID: 42, defaultScope: macDefaultOutput,
-		fifo: macFIFO{data: make([]byte, 256)},
-	}
-	s.lastCallback.Store(time.Now().UnixNano())
-	s.startDefaultMonitor()
-	defer s.stopDefaultMonitor()
-	deadline := time.Now().Add(time.Second)
-	for !s.failed.Load() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if !s.failed.Load() {
-		t.Fatal("default device change was not detected")
-	}
+	// The callback-liveness check still requests a reconnect if the
+	// previous output device stops producing callbacks.
+	s.lastCallback.Store(time.Now().Add(-3 * time.Second).UnixNano())
 	if _, err := s.transfer(make([]byte, 8)); err == nil {
-		t.Fatal("playback did not request a reconnect")
+		t.Fatal("stopped CoreAudio callback did not request a reconnect")
 	}
 }
 
@@ -100,8 +60,8 @@ func TestCoreAudioOutputUnderrunCountsMissingFrames(t *testing.T) {
 	if !bytes.Equal(out[:8], first) || !bytes.Equal(out[8:], make([]byte, 8)) {
 		t.Fatalf("rendered output = %v", out)
 	}
-	underruns, missing := b.outputUnderruns()
-	if underruns != 1 || missing != 1 {
-		t.Fatalf("CoreAudio underruns=%d missing frames=%d, want 1 and 1", underruns, missing)
+	callbacks, underruns, missing := b.outputStats()
+	if callbacks != 1 || underruns != 1 || missing != 1 {
+		t.Fatalf("CoreAudio callbacks=%d underruns=%d missing frames=%d, want 1 each", callbacks, underruns, missing)
 	}
 }
