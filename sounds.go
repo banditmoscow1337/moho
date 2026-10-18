@@ -5,8 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
+	"os"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 const (
@@ -79,18 +83,42 @@ type soundVoice struct {
 // completed voices and report stream errors. Streaming I/O runs on workers;
 // neither Update nor the device callback reads files.
 type Driver struct {
-	controlMu  sync.Mutex // serializes public operations
-	mu         sync.Mutex // protects the voices from the device callback
-	backend    Backend
-	device     Device
-	voices     []soundVoice
-	cache      map[string]cachedPCM
-	master     float64
-	serial     VoiceID
-	paused     bool
-	closed     bool
-	pendingErr error
-	workers    sync.WaitGroup
+	controlMu     sync.Mutex // serializes public operations
+	mu            sync.Mutex // protects the voices from the device callback
+	backend       Backend
+	device        Device
+	voices        []soundVoice
+	cache         map[string]cachedPCM
+	master        float64
+	serial        VoiceID
+	paused        bool
+	closed        bool
+	pendingErr    error
+	workers       sync.WaitGroup
+	streamStarves atomic.Uint64
+	debug         bool
+	nextReport    time.Time           // accessed under controlMu
+	lastReport    PlaybackDiagnostics // accessed under controlMu
+}
+
+// PlaybackDiagnostics counts callbacks that ran out of streaming PCM and
+// CoreAudio callbacks that had to fill an empty output FIFO with silence.
+// Counters are cumulative for the lifetime of the driver.
+type PlaybackDiagnostics struct {
+	StreamStarves       uint64
+	NativeUnderruns     uint64
+	NativeMissingFrames uint64
+}
+
+func (d *Driver) Diagnostics() PlaybackDiagnostics {
+	if d == nil {
+		return PlaybackDiagnostics{}
+	}
+	stats := PlaybackDiagnostics{StreamStarves: d.streamStarves.Load()}
+	if output, ok := d.backend.(interface{ outputUnderruns() (uint64, uint64) }); ok {
+		stats.NativeUnderruns, stats.NativeMissingFrames = output.outputUnderruns()
+	}
+	return stats
 }
 
 type cachedPCM struct {
@@ -112,7 +140,10 @@ func NewDriverWithBackend(maxVoices int, backend Backend) (*Driver, error) {
 	if backend == nil {
 		return nil, errors.New("audio backend is nil")
 	}
-	d := &Driver{backend: backend, voices: make([]soundVoice, maxVoices), cache: make(map[string]cachedPCM), master: 1}
+	d := &Driver{
+		backend: backend, voices: make([]soundVoice, maxVoices), cache: make(map[string]cachedPCM), master: 1,
+		debug: os.Getenv("MOHO_AUDIO_DIAGNOSTICS") == "1", nextReport: time.Now().Add(3 * time.Second),
+	}
 	if err := backend.Init(); err != nil {
 		_ = backend.Close()
 		return nil, err
@@ -386,10 +417,21 @@ func (d *Driver) feedStream(v *soundVoice, id VoiceID, sound *Sound, width int, 
 }
 
 // Update reclaims completed voices and reports asynchronous stream errors.
+// MOHO_AUDIO_DIAGNOSTICS=1 logs dropout counter changes every three seconds.
 func (d *Driver) Update() error {
 	d.controlMu.Lock()
 	defer d.controlMu.Unlock()
-	return d.updateLocked()
+	err := d.updateLocked()
+	if d.debug && time.Now().After(d.nextReport) {
+		stats := d.Diagnostics()
+		log.Printf("moho audio stream_starves=%d fifo_underruns=%d fifo_missing_frames=%d",
+			stats.StreamStarves-d.lastReport.StreamStarves,
+			stats.NativeUnderruns-d.lastReport.NativeUnderruns,
+			stats.NativeMissingFrames-d.lastReport.NativeMissingFrames)
+		d.lastReport = stats
+		d.nextReport = time.Now().Add(3 * time.Second)
+	}
+	return err
 }
 
 func (d *Driver) updateLocked() error {
@@ -563,6 +605,9 @@ func (d *Driver) callback(output, _ []byte, frameCount uint32) {
 		for frame := 0; frame < frames; frame++ {
 			left, right, ok := v.nextFrame()
 			if !ok {
+				if v.streaming && !v.streamEOF {
+					d.streamStarves.Add(1)
+				}
 				break
 			}
 			i := frame * 8

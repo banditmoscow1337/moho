@@ -47,6 +47,8 @@ type macBufferList struct {
 type coreAudioBackend struct {
 	mu                        sync.Mutex
 	core, toolbox, foundation uintptr
+	playbackUnderruns         atomic.Uint64
+	playbackMissingFrames     atomic.Uint64
 	propertySize              func(uint32, *macAddress, uint32, uintptr, *uint32) int32
 	property                  func(uint32, *macAddress, uint32, uintptr, *uint32, uintptr) int32
 	stringCopy                func(uintptr, []byte, int64, uint32) int32
@@ -60,6 +62,10 @@ type coreAudioBackend struct {
 	start                     func(uintptr) int32
 	stop                      func(uintptr) int32
 	render                    func(uintptr, uintptr, uintptr, uint32, uint32, uintptr) int32
+}
+
+func (b *coreAudioBackend) outputUnderruns() (uint64, uint64) {
+	return b.playbackUnderruns.Load(), b.playbackMissingFrames.Load()
 }
 
 func macBind(h uintptr, dest any, name string) error {
@@ -283,7 +289,8 @@ type macStream struct {
 	failed       atomic.Bool
 	deviceID     uint32
 	defaultScope uint32
-	nextCheck    time.Time // accessed only by the transfer goroutine
+	checkStop    chan struct{}
+	checkDone    chan struct{}
 }
 
 func (b *coreAudioBackend) openUnit(c DeviceConfig, id uint32, playback bool) (_ *macStream, err error) {
@@ -360,6 +367,7 @@ func (b *coreAudioBackend) openUnit(c DeviceConfig, id uint32, playback bool) (_
 	if status := b.start(unit); status != 0 {
 		return nil, fmt.Errorf("AUHAL start: %d", status)
 	}
+	s.startDefaultMonitor()
 	return s, nil
 }
 
@@ -404,17 +412,50 @@ func (s *macStream) transfer(buf []byte) (int, error) {
 	if time.Since(time.Unix(0, s.lastCallback.Load())) > 2*time.Second {
 		return 0, errors.New("CoreAudio device stopped calling back")
 	}
-	if s.defaultScope != 0 && time.Now().After(s.nextCheck) {
-		s.nextCheck = time.Now().Add(time.Second)
-		id, err := s.api.deviceID("", s.defaultScope)
-		if err != nil || id != s.deviceID {
-			return 0, errors.New("CoreAudio default device changed")
-		}
-	}
 	if s.playback {
 		return s.fifo.write(buf), nil
 	}
 	return s.fifo.read(buf), nil
+}
+
+// Querying CoreAudio's default device can block. Keep it off the goroutine
+// that fills the playback FIFO; a failed check makes the transfer loop reopen.
+func (s *macStream) startDefaultMonitor() {
+	if s.defaultScope == 0 {
+		return
+	}
+	s.checkStop = make(chan struct{})
+	s.checkDone = make(chan struct{})
+	go func() {
+		defer close(s.checkDone)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.checkStop:
+				return
+			default:
+			}
+			id, err := s.api.deviceID("", s.defaultScope)
+			if err != nil || id != s.deviceID {
+				s.failed.Store(true)
+				return
+			}
+			select {
+			case <-s.checkStop:
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
+func (s *macStream) stopDefaultMonitor() {
+	if s.checkStop != nil {
+		close(s.checkStop)
+		<-s.checkDone
+		s.checkStop = nil
+	}
 }
 func (s *macStream) receive(flags, stamp uintptr, frames uint32) {
 	s.lastCallback.Store(time.Now().UnixNano())
@@ -443,11 +484,16 @@ func (s *macStream) renderOutput(frames uint32, ptr unsafe.Pointer) {
 	buf := unsafe.Slice((*byte)(list.Buffer.Data), size)
 	n := s.fifo.read(buf)
 	clear(buf[n:])
+	if n < size {
+		s.api.playbackUnderruns.Add(1)
+		s.api.playbackMissingFrames.Add(uint64((size - n) / (s.channels * 4)))
+	}
 }
 func (s *macStream) close() error {
 	if s.unit == 0 {
 		return nil
 	}
+	s.stopDefaultMonitor()
 	_ = s.api.stop(s.unit)
 	macCallbacks.Delete(s.id)
 	_ = s.api.uninitialize(s.unit)
