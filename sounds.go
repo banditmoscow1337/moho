@@ -10,8 +10,9 @@ import (
 )
 
 const (
-	soundOutputRate = 48000
-	soundChunk      = 65536
+	soundOutputRate  = 48000
+	soundChunk       = 65536
+	soundStreamAhead = soundChunk * 4
 )
 
 // VoiceID identifies a particular playback, even after its voice slot is reused.
@@ -67,17 +68,18 @@ type soundVoice struct {
 	format                                        PCMFormat
 	width                                         int
 	pcm                                           []byte
-	stream                                        io.ReadCloser
+	streamWake                                    chan struct{}
+	streamStop                                    chan struct{}
 	streaming, streamEOF, loop, duringPause, done bool
-	readSinceOpen                                 int
 	pos                                           float64 // source frames, including the fractional resampling position
 }
 
 // Driver plays game sounds on moho's native playback device without OpenAL.
-// Call Update regularly (for example once per game tick) to feed streams and
-// release naturally completed voices. The device callback never reads files.
+// Call Update regularly (for example once per game tick) to release naturally
+// completed voices and report stream errors. Streaming I/O runs on workers;
+// neither Update nor the device callback reads files.
 type Driver struct {
-	controlMu  sync.Mutex // serializes public operations and stream I/O
+	controlMu  sync.Mutex // serializes public operations
 	mu         sync.Mutex // protects the voices from the device callback
 	backend    Backend
 	device     Device
@@ -88,6 +90,7 @@ type Driver struct {
 	paused     bool
 	closed     bool
 	pendingErr error
+	workers    sync.WaitGroup
 }
 
 type cachedPCM struct {
@@ -165,7 +168,8 @@ func (d *Driver) Preload(sound *Sound) error {
 }
 
 // Play starts a voice, or returns the existing voice for a looping sound name.
-// A low-priority request may return ID zero and a nil error.
+// A low-priority request may return ID zero and a nil error. Streaming sources
+// open asynchronously; their I/O errors are returned by Update.
 func (d *Driver) Play(sound *Sound, priority float64, loop bool) (VoiceID, error) {
 	return d.play(sound, priority, loop, false)
 }
@@ -184,6 +188,9 @@ func (d *Driver) play(sound *Sound, priority float64, loop, duringPause bool) (V
 	if sound == nil || math.IsNaN(priority) || math.IsNaN(sound.BaseVolume) ||
 		math.IsInf(sound.BaseVolume, 0) || sound.BaseVolume < 0 {
 		return 0, errors.New("invalid sound or priority")
+	}
+	if sound.Streaming && sound.PCMOpener == nil {
+		return 0, errors.New("streaming sound has no PCM opener")
 	}
 	width, err := sound.Format.frameBytes()
 	if err != nil {
@@ -236,111 +243,149 @@ func (d *Driver) play(sound *Sound, priority float64, loop, duringPause bool) (V
 		return 0, err
 	}
 	var pcm []byte
-	var stream io.ReadCloser
-	if sound.Streaming {
-		stream, err = sound.OpenPCM()
-	} else {
+	if !sound.Streaming {
 		pcm, err = d.staticPCM(sound)
-	}
-	if err != nil {
-		return 0, err
+		if err != nil {
+			return 0, err
+		}
 	}
 	d.serial++
 	if d.serial == 0 {
 		d.serial++
 	}
 	v := &d.voices[slot]
+	var wake, stop chan struct{}
+	if sound.Streaming {
+		wake, stop = make(chan struct{}, 1), make(chan struct{})
+	}
 	d.mu.Lock()
 	*v = soundVoice{
 		id: d.serial, started: d.serial, name: sound.Name, category: sound.Category,
 		priority: priority, baseVolume: sound.BaseVolume, sound: sound, format: sound.Format, width: width,
-		pcm: pcm, stream: stream, streaming: sound.Streaming,
+		pcm: pcm, streamWake: wake, streamStop: stop, streaming: sound.Streaming,
 		loop: loop, duringPause: duringPause && d.paused,
 	}
 	d.mu.Unlock()
-	if stream != nil {
-		if err := d.refillLocked(v, sound); err != nil {
-			return 0, errors.Join(err, d.releaseLocked(v))
-		}
-		d.mu.Lock()
-		empty := len(v.pcm) == 0
-		d.mu.Unlock()
-		if empty {
-			return 0, errors.Join(fmt.Errorf("sound %s: empty PCM stream", sound.Name), d.releaseLocked(v))
-		}
+	if sound.Streaming {
+		d.workers.Add(1)
+		go d.feedStream(v, d.serial, sound, width, loop, wake, stop)
 	}
-	return v.id, nil
+	return d.serial, nil
 }
 
-// refillLocked performs stream I/O outside the device callback and its mutex.
-// The caller holds controlMu, so Stop and Close cannot close the reader here.
-func (d *Driver) refillLocked(v *soundVoice, sound *Sound) error {
-	for chunks := 0; chunks < 3; chunks++ {
+// feedStream owns the reader and decodes ahead without holding either driver
+// mutex during I/O. A reused voice slot is identified by its unique ID.
+func (d *Driver) feedStream(v *soundVoice, id VoiceID, sound *Sound, width int, loop bool, wake, stop <-chan struct{}) {
+	defer d.workers.Done()
+	var stream io.ReadCloser
+	var streamErr error
+	defer func() {
+		if stream != nil {
+			streamErr = errors.Join(streamErr, stream.Close())
+		}
+		if streamErr != nil {
+			d.mu.Lock()
+			if v.id == id {
+				if d.pendingErr == nil {
+					d.pendingErr = streamErr
+				}
+				v.done = true
+			}
+			d.mu.Unlock()
+		}
+	}()
+
+	bytesSinceOpen := 0
+	for {
 		d.mu.Lock()
-		needsData := v.id != 0 && v.streaming && !v.streamEOF && !v.done && len(v.pcm) < soundChunk*2
+		active := v.id == id && v.streaming && !v.done
+		queued := len(v.pcm)
 		d.mu.Unlock()
-		if !needsData {
-			break
+		if !active {
+			return
+		}
+		if queued >= soundStreamAhead {
+			select {
+			case <-wake:
+			case <-stop:
+				return
+			}
+			continue
+		}
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		if stream == nil {
+			var err error
+			stream, err = sound.OpenPCM()
+			if err != nil {
+				streamErr = err
+				return
+			}
+			bytesSinceOpen = 0
 		}
 		data := make([]byte, soundChunk)
-		n, err := io.ReadFull(v.stream, data)
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-			return fmt.Errorf("sound %s: read PCM: %w", v.name, err)
-		}
-		if n%v.width != 0 {
-			return fmt.Errorf("sound %s: incomplete PCM frame", v.name)
+		n, err := io.ReadFull(stream, data)
+		if n%width != 0 {
+			streamErr = fmt.Errorf("sound %s: incomplete PCM frame", sound.Name)
+			return
 		}
 		if n > 0 {
 			d.mu.Lock()
-			// Compact the queue before appending, keeping memory bounded.
-			if len(v.pcm)+n > cap(v.pcm) && cap(v.pcm) > soundChunk*3 {
-				v.pcm = append([]byte(nil), v.pcm...)
+			if v.id != id || !v.streaming || v.done {
+				d.mu.Unlock()
+				return
 			}
 			v.pcm = append(v.pcm, data[:n]...)
 			d.mu.Unlock()
-			v.readSinceOpen += n
+			bytesSinceOpen += n
 		}
 		if err == nil {
 			continue
 		}
-		if !v.loop {
+		if err != io.EOF && err != io.ErrUnexpectedEOF {
+			streamErr = fmt.Errorf("sound %s: read PCM: %w", sound.Name, err)
+			return
+		}
+		if !loop {
 			d.mu.Lock()
-			v.streamEOF = true
+			if v.id == id {
+				v.streamEOF = true
+				if len(v.pcm) == 0 {
+					v.done = true
+					streamErr = fmt.Errorf("sound %s: empty PCM stream", sound.Name)
+				}
+			}
 			d.mu.Unlock()
-			break
+			return
 		}
-		if v.readSinceOpen == 0 {
-			return fmt.Errorf("sound %s: empty PCM stream", v.name)
+		if bytesSinceOpen == 0 {
+			streamErr = fmt.Errorf("sound %s: empty PCM stream", sound.Name)
+			return
 		}
-		// A small looping sound fits in memory and can loop seamlessly without
-		// waiting for the next Update to reopen its reader.
+		// Once a tiny looping stream is fully buffered, use the static
+		// playback path so its wrap does not depend on worker scheduling.
 		d.mu.Lock()
-		smallLoop := v.readSinceOpen <= soundChunk && len(v.pcm) == v.readSinceOpen && v.pos == 0
+		smallLoop := v.id == id && bytesSinceOpen <= soundChunk &&
+			len(v.pcm) == bytesSinceOpen && v.pos == 0
 		if smallLoop {
 			v.streaming = false
 		}
 		d.mu.Unlock()
 		if smallLoop {
-			stream := v.stream
-			v.stream = nil
-			return stream.Close()
+			return
 		}
-		stream := v.stream
-		v.stream = nil
-		if closeErr := stream.Close(); closeErr != nil {
-			return closeErr
+		if streamErr = stream.Close(); streamErr != nil {
+			stream = nil
+			return
 		}
-		stream, openErr := sound.OpenPCM()
-		if openErr != nil {
-			return openErr
-		}
-		v.stream = stream
-		v.readSinceOpen = 0
+		stream = nil
 	}
-	return nil
 }
 
-// Update reclaims completed voices and fills the bounded streaming queues.
+// Update reclaims completed voices and reports asynchronous stream errors.
 func (d *Driver) Update() error {
 	d.controlMu.Lock()
 	defer d.controlMu.Unlock()
@@ -351,23 +396,21 @@ func (d *Driver) updateLocked() error {
 	if d.closed {
 		return nil
 	}
-	if d.pendingErr != nil {
-		err := d.pendingErr
-		d.pendingErr = nil
-		return err
+	d.mu.Lock()
+	pendingErr := d.pendingErr
+	d.pendingErr = nil
+	d.mu.Unlock()
+	if pendingErr != nil {
+		return pendingErr
 	}
 	for i := range d.voices {
 		v := &d.voices[i]
 		d.mu.Lock()
-		done, streaming := v.done, v.streaming
+		done := v.done
 		d.mu.Unlock()
 		if done {
 			if err := d.releaseLocked(v); err != nil {
 				return err
-			}
-		} else if streaming {
-			if err := d.refillLocked(v, v.sound); err != nil {
-				return errors.Join(err, d.releaseLocked(v))
 			}
 		}
 	}
@@ -376,16 +419,18 @@ func (d *Driver) updateLocked() error {
 
 func (d *Driver) releaseLocked(v *soundVoice) error {
 	d.mu.Lock()
-	stream := v.stream
+	stop := v.streamStop
 	*v = soundVoice{}
 	d.mu.Unlock()
-	if stream != nil {
-		return stream.Close()
+	if stop != nil {
+		close(stop)
 	}
 	return nil
 }
 
 func (d *Driver) record(err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if err != nil && d.pendingErr == nil {
 		d.pendingErr = err
 	}
@@ -487,14 +532,16 @@ func (d *Driver) Close() error {
 	for i := range d.voices {
 		result = errors.Join(result, d.releaseLocked(&d.voices[i]))
 	}
+	d.workers.Wait()
 	if d.backend != nil {
 		result = errors.Join(result, d.backend.Close())
 	}
 	d.mu.Lock()
 	d.closed = true
 	d.cache = nil
+	result = errors.Join(result, d.pendingErr)
 	d.mu.Unlock()
-	return errors.Join(d.pendingErr, result)
+	return result
 }
 
 // callback mixes directly into the backend's little-endian float32 output.
@@ -530,6 +577,11 @@ func (d *Driver) callback(output, _ []byte, frameCount uint32) {
 			v.pos -= float64(drop)
 			if v.streamEOF && len(v.pcm) == 0 {
 				v.done = true
+			} else if len(v.pcm) < soundStreamAhead {
+				select {
+				case v.streamWake <- struct{}{}:
+				default:
+				}
 			}
 		}
 	}
