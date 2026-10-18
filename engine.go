@@ -60,13 +60,11 @@ type JitterBuffer struct {
 
 	// Slots are tagged to distinguish sequence numbers that share a ring index.
 	slots [JitterBufferWindow]jitterSlot
-
 	// count tracks the number of filled slots.
 	count int
 
 	latestSeq   uint16
 	initialized bool
-
 	// closed prevents new pushes during cleanup to avoid leaks.
 	closed bool
 
@@ -78,6 +76,44 @@ type JitterBuffer struct {
 	stats       JitterStats
 }
 
+var jitterBufferPool = sync.Pool{
+	New: func() any {
+		return &JitterBuffer{}
+	},
+}
+
+// emptyInputs is an immutable empty peer map shared by idle engines.
+var emptyInputs = make(map[string]*JitterBuffer)
+
+var inputsMapPool = sync.Pool{
+	New: func() any {
+		return make(map[string]*JitterBuffer, 8)
+	},
+}
+
+func acquireInputsMap() map[string]*JitterBuffer {
+	m := inputsMapPool.Get().(map[string]*JitterBuffer)
+	clear(m)
+	return m
+}
+
+func releaseInputsMap(m map[string]*JitterBuffer) {
+	if len(m) == 0 {
+		return
+	}
+	clear(m)
+	inputsMapPool.Put(m)
+}
+
+var enginePool = sync.Pool{
+	New: func() any {
+		e := &Engine{}
+		e.callback = e.onAudioCallback
+		e.inputs.Store(emptyInputs)
+		return e
+	},
+}
+
 // NewJitterBuffer creates a buffer with a specific target latency depth.
 // The depth represents the number of frames to buffer before starting playback
 // to handle network jitter.
@@ -87,10 +123,12 @@ func NewJitterBuffer(targetDepth int) *JitterBuffer {
 	} else if targetDepth > JitterBufferWindow {
 		targetDepth = JitterBufferWindow
 	}
-	return &JitterBuffer{
+	jb := jitterBufferPool.Get().(*JitterBuffer)
+	*jb = JitterBuffer{
 		buffering:   true,
 		targetDepth: targetDepth,
 	}
+	return jb
 }
 
 // Level returns the approximate number of packets currently in the buffer.
@@ -137,7 +175,6 @@ func (jb *JitterBuffer) trimToHead(head uint16) {
 // Push inserts a packet into the buffer based on its Sequence ID.
 // It handles out-of-order arrival, duplicate detection, and protection against
 // sequence wrapping.
-//
 // Push accepts ownership of the *[]byte data. If the packet
 // is rejected (old/duplicate) or overwritten, Push handles freeing it back to the pool.
 // This method is safe to call from multiple network routines concurrently.
@@ -145,6 +182,7 @@ func (jb *JitterBuffer) Push(seq uint16, data *[]byte) {
 	if data == nil {
 		return
 	}
+
 	jb.mu.Lock()
 	defer jb.mu.Unlock()
 
@@ -181,8 +219,7 @@ func (jb *JitterBuffer) Push(seq uint16, data *[]byte) {
 				releasePacket(data)
 				return
 			}
-		}
-		if ahead > JitterBufferWindow {
+		} else if ahead > JitterBufferWindow {
 			// A gap or a producer running ahead of playback must not keep
 			// stale audio. Reset in bounded time and rebuffer at the new seq.
 			jb.stats.OverflowPackets += uint64(jb.count)
@@ -192,6 +229,7 @@ func (jb *JitterBuffer) Push(seq uint16, data *[]byte) {
 			jb.buffering = true
 		}
 	}
+
 	slot := &jb.slots[seq%JitterBufferWindow]
 	if slot.data != nil {
 		if slot.seq == seq {
@@ -205,6 +243,7 @@ func (jb *JitterBuffer) Push(seq uint16, data *[]byte) {
 		jb.count--
 		jb.stats.OverflowPackets++
 	}
+
 	*slot = jitterSlot{seq: seq, data: data}
 	jb.count++
 	if int16(seq-jb.latestSeq) > 0 {
@@ -215,7 +254,6 @@ func (jb *JitterBuffer) Push(seq uint16, data *[]byte) {
 // Pop retrieves the next sequential audio packet pointer for playback.
 // It returns a *[]byte from the pool, or nil if the buffer is buffering/empty (underrun).
 // The caller MUST call releasePacket() on the returned pointer after use.
-//
 // This method MUST ONLY be called by the single audio consumer thread (e.g., the audio callback).
 func (jb *JitterBuffer) Pop() *[]byte {
 	jb.mu.Lock()
@@ -239,16 +277,16 @@ func (jb *JitterBuffer) Pop() *[]byte {
 	// Retrieve Next Packet
 	next := jb.lastPopped + 1
 	slot := &jb.slots[next%JitterBufferWindow]
-
 	var ptr *[]byte
 	if slot.seq == next {
 		ptr = slot.data
-		if ptr != nil {
-			*slot = jitterSlot{}
-			jb.count--
-			jb.lastPopped = next
-		}
 	}
+	if ptr != nil {
+		*slot = jitterSlot{}
+		jb.count--
+	}
+
+	jb.lastPopped = next
 
 	if ptr != nil {
 		return ptr
@@ -260,6 +298,7 @@ func (jb *JitterBuffer) Pop() *[]byte {
 	if jb.count == 0 {
 		jb.buffering = true
 	}
+
 	// Return nil triggers Packet Loss Concealment (PLC) in the Opus decoder.
 	return nil
 }
@@ -268,20 +307,22 @@ func (jb *JitterBuffer) Pop() *[]byte {
 // It must be called when removing a peer to prevent memory leaks of pooled buffers.
 func (jb *JitterBuffer) Cleanup() {
 	jb.mu.Lock()
-	defer jb.mu.Unlock()
-
 	if jb.closed {
+		jb.mu.Unlock()
 		return
 	}
 	jb.closed = true
-
 	jb.discardAll()
+	jb.mu.Unlock()
+
 	jb.decodeMu.Lock()
 	if jb.decoder != nil {
 		_ = jb.decoder.Close()
 		jb.decoder = nil
 	}
 	jb.decodeMu.Unlock()
+
+	jitterBufferPool.Put(jb)
 }
 
 func (jb *JitterBuffer) decode(packet []byte, pcm []float32) (int, error) {
@@ -302,7 +343,9 @@ type Engine struct {
 	device    Device
 	enc       Encoder
 	pipeline  *audioPipeline
+	callback  DataCallback
 	running   bool
+	cleanedUp bool
 	controlMu sync.Mutex
 
 	// sendFunc is the callback to push encoded packets to the network.
@@ -313,7 +356,6 @@ type Engine struct {
 	// Value: *JitterBuffer
 	// We use atomic.Value to implement Copy-On-Write for the processing worker.
 	inputs atomic.Value
-
 	// stateMu serializes updates to the inputs map (Add/Remove peer).
 	// It is never held by the audio callback.
 	stateMu sync.Mutex
@@ -342,10 +384,27 @@ func NewEngine() *Engine {
 // NewEngineWithComponents lets callers exercise the audio pipeline without
 // opening a native audio device. Each Engine owns its backend and codec states.
 func NewEngineWithComponents(backend Backend, codecs CodecFactory) *Engine {
-	e := &Engine{backend: backend, codecs: codecs}
-	// Initialize the atomic inputs map
-	e.inputs.Store(make(map[string]*JitterBuffer))
+	e := enginePool.Get().(*Engine)
+	e.backend = backend
+	e.codecs = codecs
+	e.device = nil
+	e.enc = nil
+	e.pipeline = nil
+	e.running = false
+	e.cleanedUp = false
+	e.sendFunc = nil
+	e.sendSeq = 0
+	e.inputID = ""
+	e.outputID = ""
+	e.timingEnabled = false
+	e.generation = 0
+	atomic.StoreInt32(&e.muted, 0)
+	e.inputs.Store(emptyInputs)
 	return e
+}
+
+func (e *Engine) onAudioCallback(output, input []byte, frameCount uint32) {
+	e.pipeline.callback(output, input, frameCount)
 }
 
 // SetMute controls the microphone input state.
@@ -430,18 +489,22 @@ func (e *Engine) SelectDevices(input, output DeviceID) error {
 func (e *Engine) Stats() AudioStats {
 	e.controlMu.Lock()
 	defer e.controlMu.Unlock()
+
 	stats := AudioStats{}
 	if e.pipeline != nil {
 		stats = e.pipeline.stats()
 	}
 	stats.Generation, stats.Running = e.generation, e.running
-	stats.Peers = len(e.inputs.Load().(map[string]*JitterBuffer))
-	for _, jb := range e.inputs.Load().(map[string]*JitterBuffer) {
+	e.mixMu.RLock()
+	inputs := e.inputs.Load().(map[string]*JitterBuffer)
+	stats.Peers = len(inputs)
+	for _, jb := range inputs {
 		jitter := jb.Stats()
 		stats.JitterLate += jitter.LatePackets
 		stats.JitterDuplicate += jitter.DuplicatePackets
 		stats.JitterOverflow += jitter.OverflowPackets
 	}
+	e.mixMu.RUnlock()
 	return stats
 }
 
@@ -477,7 +540,6 @@ func (e *Engine) initLocked() error {
 			return fmt.Errorf("failed to create opus encoder: %w", err)
 		}
 	}
-
 	if err := e.backend.Init(); err != nil {
 		_ = e.enc.Close()
 		e.enc = nil
@@ -485,18 +547,22 @@ func (e *Engine) initLocked() error {
 	}
 
 	config := DeviceConfig{
-		InputID: e.inputID, OutputID: e.outputID,
-		SampleRate: SampleRate, Channels: Channels, PeriodMillis: FrameSizeMs,
+		InputID:      e.inputID,
+		OutputID:     e.outputID,
+		SampleRate:   SampleRate,
+		Channels:     Channels,
+		PeriodMillis: FrameSizeMs,
 	}
-
 	e.pipeline = newAudioPipeline(e)
-	e.device, err = e.backend.Open(config, e.pipeline.callback)
+	e.device, err = e.backend.Open(config, e.callback)
 	if err != nil {
 		_ = e.enc.Close()
 		e.enc = nil
+		releaseAudioPipeline(e.pipeline)
 		e.pipeline = nil
+		return err
 	}
-	return err
+	return nil
 }
 
 // Start begins the PCM processing loop and starts hardware I/O. sendCallback
@@ -513,12 +579,14 @@ func (e *Engine) startLocked(sendCallback func([]byte)) error {
 	}
 	e.sendFunc = sendCallback
 	e.sendSeq = 0
+
 	if e.device == nil {
 		if err := e.initLocked(); err != nil {
 			e.sendFunc = nil
 			return err
 		}
 	}
+
 	e.pipeline.start(sendCallback)
 	if err := e.device.Start(); err != nil {
 		e.pipeline.stop()
@@ -526,6 +594,7 @@ func (e *Engine) startLocked(sendCallback func([]byte)) error {
 		e.resetLocked()
 		return err
 	}
+
 	e.running = true
 	e.generation++
 	return nil
@@ -553,6 +622,7 @@ func (e *Engine) stopLocked() {
 func (e *Engine) Restart() error {
 	e.controlMu.Lock()
 	defer e.controlMu.Unlock()
+
 	running := e.running
 	cb := e.sendFunc
 	e.stopLocked()
@@ -576,6 +646,7 @@ func (e *Engine) resetLocked() {
 		_ = e.device.Close()
 		e.device = nil
 	}
+	releaseAudioPipeline(e.pipeline)
 	e.pipeline = nil
 	if e.enc != nil {
 		_ = e.enc.Close()
@@ -586,11 +657,25 @@ func (e *Engine) resetLocked() {
 // Cleanup stops the engine and frees all native resources (Context, Encoder).
 func (e *Engine) Cleanup() {
 	e.controlMu.Lock()
-	defer e.controlMu.Unlock()
+	if e.cleanedUp {
+		e.controlMu.Unlock()
+		return
+	}
 	e.stopLocked()
 	e.resetLocked()
 	e.RemoveAllPeers()
-	_ = e.backend.Close()
+	if e.backend != nil {
+		_ = e.backend.Close()
+	}
+	e.sendSeq = 0
+	e.inputID = ""
+	e.outputID = ""
+	e.timingEnabled = false
+	e.generation = 0
+	atomic.StoreInt32(&e.muted, 0)
+	e.cleanedUp = true
+	e.controlMu.Unlock()
+	enginePool.Put(e)
 }
 
 // AddPeer creates a new JitterBuffer for the specified peer ID and adds them to the mix.
@@ -612,8 +697,8 @@ func (e *Engine) AddPeer(id string) error {
 		return err
 	}
 
-	// Clone to new map
-	newMap := make(map[string]*JitterBuffer, len(oldMap)+1)
+	// Clone to pooled map
+	newMap := acquireInputsMap()
 	maps.Copy(newMap, oldMap)
 
 	// Add new peer
@@ -623,6 +708,12 @@ func (e *Engine) AddPeer(id string) error {
 
 	// Atomically Swap
 	e.inputs.Store(newMap)
+
+	if len(oldMap) > 0 {
+		e.mixMu.Lock()
+		e.mixMu.Unlock()
+		releaseInputsMap(oldMap)
+	}
 	return nil
 }
 
@@ -633,24 +724,29 @@ func (e *Engine) RemovePeer(id string) {
 	defer e.stateMu.Unlock()
 
 	oldMap := e.inputs.Load().(map[string]*JitterBuffer)
-
 	removed, exists := oldMap[id]
 	if !exists {
 		return
 	}
 
 	// Clone and Delete
-	newMap := make(map[string]*JitterBuffer, len(oldMap))
-	for k, v := range oldMap {
-		if k != id {
-			newMap[k] = v
+	if len(oldMap) == 1 {
+		e.inputs.Store(emptyInputs)
+	} else {
+		newMap := acquireInputsMap()
+		for k, v := range oldMap {
+			if k != id {
+				newMap[k] = v
+			}
 		}
+		e.inputs.Store(newMap)
 	}
 
-	e.inputs.Store(newMap)
 	e.mixMu.Lock()
 	removed.Cleanup()
 	e.mixMu.Unlock()
+
+	releaseInputsMap(oldMap)
 }
 
 // RemoveAllPeers clears all active peers from the engine and cleans up their buffers.
@@ -660,16 +756,21 @@ func (e *Engine) RemoveAllPeers() {
 	defer e.stateMu.Unlock()
 
 	oldMap := e.inputs.Load().(map[string]*JitterBuffer)
-	e.inputs.Store(make(map[string]*JitterBuffer))
+	if len(oldMap) == 0 {
+		return
+	}
+	e.inputs.Store(emptyInputs)
+
 	e.mixMu.Lock()
 	for _, v := range oldMap {
 		v.Cleanup()
 	}
 	e.mixMu.Unlock()
+
+	releaseInputsMap(oldMap)
 }
 
 // ProcessIncoming routes an incoming audio packet to the appropriate peer's JitterBuffer.
-//
 // This method accepts ownership of the data pointer. If the peer is unknown
 // or the data is invalid, it frees the packet immediately back to the pool.
 // It is designed to be called directly from the network ingress layer.
@@ -677,22 +778,23 @@ func (e *Engine) ProcessIncoming(sourceID string, data *[]byte) {
 	if data == nil {
 		return
 	}
-
 	if len(*data) < 3 || len(*data) > voicebuf.PacketSize {
 		releasePacket(data)
 		return
 	}
+
 	// Parse Sequence ID from first 2 bytes
 	seq := binary.BigEndian.Uint16((*data)[0:2])
 
 	// Keep the original base slice for the shared pool. Only the decoder
 	// receives a payload subslice; advancing *data would retain a truncated
 	// backing view and prevent safe reuse of the original allocation.
-
-	// Lock-free read for network thread
+	e.mixMu.RLock()
 	currentInputs := e.inputs.Load().(map[string]*JitterBuffer)
+	jb, exists := currentInputs[sourceID]
+	e.mixMu.RUnlock()
 
-	if jb, exists := currentInputs[sourceID]; exists {
+	if exists {
 		// Pass ownership to JitterBuffer
 		jb.Push(seq, data)
 	} else {

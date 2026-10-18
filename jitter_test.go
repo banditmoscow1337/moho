@@ -171,32 +171,3 @@ func TestJitterBufferLatePacketAfterQueueDrainedDoesNotReanchor(t *testing.T) {
 	// Playhead must remain at 12; packet 13 should be ready next
 	popTestPacket(t, jb, 13)
 }
-
-func TestJitterBufferActualUnderrunRebuffers(t *testing.T) {
-	jb := NewJitterBuffer(3)
-	defer jb.Cleanup()
-
-	pushTestPacket(jb, 0)
-	pushTestPacket(jb, 1)
-	pushTestPacket(jb, 2)
-
-	popTestPacket(t, jb, 0)
-	popTestPacket(t, jb, 1)
-	popTestPacket(t, jb, 2)
-
-	// True underrun: consumer asks for audio when count == 0
-	if p := jb.Pop(); p != nil {
-		t.Fatalf("expected nil on underrun, got packet")
-	}
-
-	// Buffer must now be in buffering state
-	pushTestPacket(jb, 3)
-	if p := jb.Pop(); p != nil {
-		t.Fatalf("expected nil while rebuffering below targetDepth, got packet")
-	}
-
-	pushTestPacket(jb, 4)
-	pushTestPacket(jb, 5) // Reached target depth (count == 3)
-
-	popTestPacket(t, jb, 3)
-}

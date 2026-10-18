@@ -8,11 +8,19 @@ import (
 	"time"
 )
 
+var pipelinePool = sync.Pool{
+	New: func() any {
+		return &audioPipeline{
+			capture:  newPCMRing(FrameSizeSamples * Channels * 8),
+			playback: newPCMRing(FrameSizeSamples * Channels * 4),
+			wake:     make(chan struct{}, 1),
+			worker:   newPCMWorker(),
+		}
+	},
+}
+
 const frameBytes = FrameSizeSamples * Channels * 4
 
-// AudioStats includes ring loss in samples and codec/jitter errors in packets.
-// Pipeline counters reset on Start; Generation distinguishes successful starts.
-// Jitter counters belong to peer buffers and disappear when peers are removed.
 type AudioStats struct {
 	Generation      uint64
 	Running         bool
@@ -32,44 +40,61 @@ type AudioStats struct {
 	JitterOverflow  uint64
 }
 
-// audioPipeline owns two single-producer/single-consumer rings. The hardware
-// callback only copies PCM and signals the worker; all codec and peer work
-// happens on the worker goroutine.
 type audioPipeline struct {
 	engine   *Engine
 	capture  pcmRing // callback writes, worker reads
 	playback pcmRing // worker writes, callback reads
 	wake     chan struct{}
-	quit     chan struct{}
+	stopping atomic.Bool
+	running  bool
 	wg       sync.WaitGroup
+	worker   *pcmWorker
 
 	captureDropped  atomic.Uint64
 	playbackDropped atomic.Uint64
 	playbackSilence atomic.Uint64
 	encodeErrors    atomic.Uint64
 	decodeErrors    atomic.Uint64
-	timing          bool
-	callbackTiming  durationCounter
-	workerTiming    durationCounter
+
+	timing         bool
+	callbackTiming durationCounter
+	workerTiming   durationCounter
 }
 
 func newAudioPipeline(e *Engine) *audioPipeline {
-	return &audioPipeline{
-		engine:   e,
-		capture:  newPCMRing(FrameSizeSamples * Channels * 8),
-		playback: newPCMRing(FrameSizeSamples * Channels * 4),
-		wake:     make(chan struct{}, 1),
-		timing:   e.timingEnabled,
-	}
+	p := pipelinePool.Get().(*audioPipeline)
+	p.engine = e
+	p.timing = e.timingEnabled
+	p.stopping.Store(false)
+	p.running = false
+	p.capture.reset()
+	p.playback.reset()
+	p.captureDropped.Store(0)
+	p.playbackDropped.Store(0)
+	p.playbackSilence.Store(0)
+	p.encodeErrors.Store(0)
+	p.decodeErrors.Store(0)
+	p.callbackTiming.reset()
+	p.workerTiming.reset()
+	return p
 }
 
-// callback never calls the codec, peers, network or user code. The backend
-// supplies borrowed byte slices in little-endian interleaved float32 format.
+func releaseAudioPipeline(p *audioPipeline) {
+	if p == nil {
+		return
+	}
+	p.engine = nil
+	pipelinePool.Put(p)
+}
+
 func (p *audioPipeline) callback(output, input []byte, frameCount uint32) {
 	if p.timing {
 		start := time.Now()
-		defer func() { p.callbackTiming.observe(time.Since(start), time.Duration(frameCount)*time.Second/SampleRate) }()
+		defer func() {
+			p.callbackTiming.observe(time.Since(start), time.Duration(frameCount)*time.Second/SampleRate)
+		}()
 	}
+
 	wanted := int(frameCount) * Channels * 4
 	available := min(wanted, len(input)) &^ 3
 	written := p.capture.writeBytes(input[:available])
@@ -84,6 +109,7 @@ func (p *audioPipeline) callback(output, input []byte, frameCount uint32) {
 	if n < readable {
 		p.playbackSilence.Add(uint64((readable - n) / 4))
 	}
+
 	select {
 	case p.wake <- struct{}{}:
 	default:
@@ -100,29 +126,33 @@ func (p *audioPipeline) start(send func([]byte)) {
 	p.decodeErrors.Store(0)
 	p.callbackTiming.reset()
 	p.workerTiming.reset()
-	// A previous call may have left a notification in the buffered channel.
+
 	select {
 	case <-p.wake:
 	default:
 	}
-	p.quit = make(chan struct{})
+
+	p.stopping.Store(false)
+	p.running = true
 	p.wg.Add(1)
-	go p.run(send, p.quit)
+	go p.run(send)
 }
 
 func (p *audioPipeline) stop() {
-	if p.quit == nil {
+	if !p.running {
 		return
 	}
-	close(p.quit)
+	p.stopping.Store(true)
+	select {
+	case p.wake <- struct{}{}:
+	default:
+	}
 	p.wg.Wait()
-	p.quit = nil
+	p.running = false
 }
 
 func (p *audioPipeline) stats() AudioStats {
 	return AudioStats{
-		// A third observer can see indices from different instants. Clamp the
-		// approximate gauge; ring producer/consumer behavior is unchanged.
 		CaptureQueued:   min(max(p.capture.len(), 0), len(p.capture.buf)) / 4,
 		PlaybackQueued:  min(max(p.playback.len(), 0), len(p.playback.buf)) / 4,
 		TimingEnabled:   p.timing,
@@ -136,21 +166,17 @@ func (p *audioPipeline) stats() AudioStats {
 	}
 }
 
-func (p *audioPipeline) run(send func([]byte), quit <-chan struct{}) {
+func (p *audioPipeline) run(send func([]byte)) {
 	defer p.wg.Done()
-	w := newPCMWorker()
-
+	w := p.worker
 	for {
-		select {
-		case <-quit:
+		<-p.wake
+		if p.stopping.Load() {
 			return
-		case <-p.wake:
 		}
 		for p.capture.len() >= frameBytes {
-			select {
-			case <-quit:
+			if p.stopping.Load() {
 				return
-			default:
 			}
 			p.capture.readBytes(w.input)
 			p.processFrame(w, send)
@@ -158,8 +184,6 @@ func (p *audioPipeline) run(send func([]byte), quit <-chan struct{}) {
 	}
 }
 
-// pcmWorker owns the buffers used by the production worker and its benchmarks.
-// processFrame requires one complete capture frame and a single caller.
 type pcmWorker struct {
 	input, encoded, output []byte
 	pcm, decoded, mixed    []float32
@@ -179,8 +203,11 @@ func newPCMWorker() *pcmWorker {
 func (p *audioPipeline) processFrame(w *pcmWorker, send func([]byte)) {
 	if p.timing {
 		start := time.Now()
-		defer func() { p.workerTiming.observe(time.Since(start), FrameSizeMs*time.Millisecond) }()
+		defer func() {
+			p.workerTiming.observe(time.Since(start), FrameSizeMs*time.Millisecond)
+		}()
 	}
+
 	muted := p.engine.IsMuted()
 	for i := range w.pcm {
 		if muted {
@@ -189,6 +216,7 @@ func (p *audioPipeline) processFrame(w *pcmWorker, send func([]byte)) {
 			w.pcm[i] = math.Float32frombits(binary.LittleEndian.Uint32(w.input[i*4:]))
 		}
 	}
+
 	n, err := p.engine.enc.EncodeFloat32(w.pcm, w.encoded[2:])
 	if err != nil {
 		p.encodeErrors.Add(1)
@@ -196,7 +224,6 @@ func (p *audioPipeline) processFrame(w *pcmWorker, send func([]byte)) {
 	if err == nil && n > 0 && send != nil {
 		binary.BigEndian.PutUint16(w.encoded[:2], p.engine.sendSeq)
 		p.engine.sendSeq++
-		// The callback must copy this borrowed packet before returning.
 		send(w.encoded[:n+2])
 	}
 
@@ -222,6 +249,7 @@ func (p *audioPipeline) processFrame(w *pcmWorker, send func([]byte)) {
 		}
 	}
 	p.engine.mixMu.RUnlock()
+
 	for i, sample := range w.mixed {
 		if sample > 1 {
 			sample = 1
@@ -230,6 +258,7 @@ func (p *audioPipeline) processFrame(w *pcmWorker, send func([]byte)) {
 		}
 		binary.LittleEndian.PutUint32(w.output[i*4:], math.Float32bits(sample))
 	}
+
 	if p.playback.len()+frameBytes <= len(p.playback.buf) {
 		p.playback.writeBytes(w.output)
 	} else {
