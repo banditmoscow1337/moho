@@ -186,9 +186,15 @@ func (d *nativeDevice) pump(stop <-chan struct{}, capture, playback pcmStream) {
 		}()
 		defer func() { close(abort); <-readDone }()
 	}
-	// The playback device paces the loop. If a backend reports zero progress,
-	// yield briefly instead of spinning at 100% CPU.
-	next := time.Now()
+	// Playback-only devices need a few periods queued before regular pacing.
+	// Otherwise each write arrives just as the previous period is consumed,
+	// and a small scheduling delay empties the native buffer. Keep the clock
+	// for virtual devices that accept writes without applying backpressure.
+	ahead := time.Duration(0)
+	if d.config.PlaybackOnly {
+		ahead = 2 * period
+	}
+	next := time.Now().Add(-ahead)
 	for {
 		select {
 		case <-stop:
@@ -228,8 +234,13 @@ func (d *nativeDevice) pump(stop <-chan struct{}, capture, playback pcmStream) {
 		next = next.Add(period)
 		if delay := time.Until(next); delay > 0 {
 			time.Sleep(delay)
+		} else if d.config.PlaybackOnly && time.Since(next) > 3*period {
+			// Rebuild the safety margin after a long scheduling pause.
+			next = time.Now().Add(-ahead)
 		} else {
-			next = time.Now()
+			if !d.config.PlaybackOnly {
+				next = time.Now()
+			}
 		}
 	}
 }
