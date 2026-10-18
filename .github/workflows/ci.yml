@@ -27,5 +27,5 @@ jobs:
             os=${target%/*}
             arch=${target#*/}
             GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/moho-${os}-${arch}.test" .
-            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/opus-${os}-${arch}.test" ./opuscodec
+            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/voicebuf-${os}-${arch}.test" ./voicebuf
           done
