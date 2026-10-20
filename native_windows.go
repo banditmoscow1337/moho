@@ -1,6 +1,6 @@
 //go:build windows && (amd64 || arm64) && !safem_test_noaudio
 
-package audio
+package moho
 
 import (
 	"errors"

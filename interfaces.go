@@ -1,4 +1,4 @@
-package audio
+package moho
 
 // DeviceID is an opaque identifier returned by a backend. The empty ID selects
 // the system default. IDs are valid only for the backend that returned them.

@@ -1,6 +1,6 @@
 //go:build !safem_test_noaudio
 
-package audio
+package moho
 
 import (
 	"encoding/binary"
